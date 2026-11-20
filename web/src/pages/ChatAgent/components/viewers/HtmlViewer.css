@@ -1,0 +1,33 @@
+.html-viewer {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  overflow: hidden;
+}
+
+/* Source view — wraps the shared SyntaxHighlighter */
+.html-viewer-source {
+  flex: 1;
+  min-height: 0;
+  overflow: auto;
+  padding: 12px;
+  tab-size: 2;
+}
+
+/* The owner's frames. Under Source they stay laid out at their size, unseen,
+   so the place read and a comment being written are where they were on the
+   way back. */
+.html-viewer {
+  position: relative;
+}
+.html-viewer-stage {
+  position: relative;
+  flex: 1;
+  min-height: 0;
+}
+.html-viewer-stage[data-shown='false'] {
+  position: absolute;
+  inset: 0;
+  visibility: hidden;
+  pointer-events: none;
+}

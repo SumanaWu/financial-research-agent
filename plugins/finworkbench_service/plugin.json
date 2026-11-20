@@ -1,0 +1,14 @@
+{
+  "$schema": "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
+  "name": "finworkbench-service",
+  "version": "1.0.0",
+  "description": "How the agent runs itself. Scheduled automations and saved workflows, and the user memory that carries context between sessions.",
+  "license": "Apache-2.0",
+  "keywords": [
+    "automation",
+    "workflow",
+    "scheduling",
+    "memory",
+    "platform"
+  ]
+}

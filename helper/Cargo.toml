@@ -1,0 +1,26 @@
+# Modified on 2026-11-17 for local study distribution; display names and nonessential project links adjusted. See MODIFICATIONS.md.
+[package]
+name = "finworkbench-helper"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+anyhow = "1"
+bytes = "1"
+clap = { version = "4", features = ["derive"] }
+libc = "0.2"
+rand = "0.10"
+russh = "0.64.1"
+tokio = { version = "1.54", features = ["full"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+ureq = { version = "3", features = ["platform-verifier"] }
+
+[dev-dependencies]
+tempfile = "3"
+tokio = { version = "1.54", features = ["test-util"] }
+
+[profile.release]
+strip = true
+lto = "thin"

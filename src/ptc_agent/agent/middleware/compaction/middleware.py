@@ -1,0 +1,1201 @@
+"""CompactionMiddleware: two-tier context management for LangGraph agents.
+
+Compaction is a view over the checkpoint, never a rewrite of it: each model
+call is sent the history after the last summary with the recorded Tier 1 cuts
+applied, so the checkpoint keeps every message and a later compaction builds
+on the one before.
+
+- Tier 1: at a turn start after a long pause, when the provider's prompt
+  cache has expired, large tool arguments are cut to a pointer at the
+  transcript file that keeps them and stale Read results are hidden, never
+  ahead of thinking a later call is checked against (see ``select_offloads``).
+  Off unless the operator turns it on (see ``OffloadSettings.idle_seconds``).
+- Tier 2: when the context reaches its threshold, or the model refuses it
+  as too long, the start of the view is summarized (see ``compact``), all of
+  it at a turn start while the thread's system prompt is due for a rebuild,
+  so the call after it can take the new one (see ``frozen_prompt.due``),
+  and mid-turn up to the step under way, which that call is sent as a row
+  (see ``carry``), after a step on the notes when they are on,
+  and on the main agent at a turn start under the threshold too, after a
+  deploy, once the prompt cache has expired, or once an expired cache holds
+  a large context, keeping the tail where nothing is due (see ``rebuild``), and
+  the attachments in what it keeps are taken out until it fits; on Claude,
+  whose kept turns are sent as they were, the summary takes them instead
+  (see ``fitting.Fit``); and between turns when the user asks (see
+  ``between_turns``).
+- The window: on the main agent, at each pass through ``before_agent``, the
+  runs a summary stands in for are trimmed from the checkpoint once the
+  server holds them (see ``window``).
+
+Each step is reported as a ``context_window`` event, whose ``action`` values
+are wire protocol: ``token_usage`` after each model call, ``summarize``
+(start, complete or error) around a summary, and ``offload`` (complete) after
+Tier 1.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import copy
+import dataclasses
+import functools
+import logging
+import time
+from collections.abc import Awaitable, Callable, Iterator, Mapping, Sequence
+from contextlib import contextmanager
+from typing import TYPE_CHECKING, Any, Literal
+
+from langchain_core.messages import AIMessage, AnyMessage, HumanMessage
+from langchain_core.runnables.base import RunnableBindingBase
+from langchain_core.runnables.config import var_child_runnable_config
+from langgraph.config import get_config, get_stream_writer
+from langgraph.constants import TAG_NOSTREAM
+from langgraph.types import Command
+from typing_extensions import override
+
+from langchain.agents.middleware.types import (
+    AgentMiddleware,
+    ExtendedModelResponse,
+    ModelRequest,
+    ModelResponse,
+)
+
+from src.llms.cache_markers import CacheScope, cache_scope
+from src.llms.error_classification import is_context_overflow
+from src.llms.provider_compaction import (
+    compaction_settings,
+    kept_user_texts,
+    native_answer,
+    native_kind,
+    replays,
+)
+
+from ptc_agent.agent.state import ensure_message_ids
+from ptc_agent.agent.middleware._utils import run_ids
+from ptc_agent.agent.middleware.model_resilience import FALLBACK_KEY
+from ptc_agent.agent.middleware.compaction.between_turns import (
+    Ask,
+    HandOff,
+    IdleCompact,
+    IdleSkipped,
+    Measure,
+    Parts,
+    WriteBrief,
+    asked,
+)
+from ptc_agent.agent.middleware.compaction.brief import brief_cut
+from ptc_agent.agent.middleware.compaction.types import CompactionState, OffloadSettings
+from ptc_agent.agent.middleware.compaction.fitting import Fit, Fitted, reported_usage
+from ptc_agent.agent.middleware.compaction.compact import (
+    NOTHING_TO_COMPACT,
+    Compaction,
+    NativeAnswer,
+    Own,
+    Summarizer,
+)
+from ptc_agent.agent.middleware.compaction.measure import (
+    ContextReading,
+    Estimate,
+    context_tokens,
+    estimate_for,
+    keep_cutoff,
+    keep_tokens_for,
+    sent_ahead,
+    stamp_context_growth,
+)
+from ptc_agent.agent.middleware.compaction.model import max_input_tokens
+from ptc_agent.agent.middleware.compaction.parts import ahead_parts
+from ptc_agent.agent.middleware.runtime_context.baseline import block_of
+from ptc_agent.agent.middleware.compaction.summarize import (
+    is_other_model,
+    summary_text,
+)
+from ptc_agent.agent.middleware.compaction.carry import last_step_row
+from ptc_agent.agent.middleware.compaction.notes import (
+    explains_notes,
+    last_step_wrote_notes,
+    rebuild_notes_ask,
+)
+from ptc_agent.agent.middleware.compaction.idle import idle_clock, idle_cut, stamping
+from ptc_agent.agent.middleware.compaction.rebuild import (
+    LAST_ANSWER_KEY,
+    StalePinRebuilds,
+    TurnStartRebuilds,
+    answer_reading,
+    arm,
+)
+from ptc_agent.agent.middleware.compaction.summary_request import (
+    finished_summary,
+    keeps_turns,
+    summary_prompt,
+)
+from ptc_agent.agent.middleware.compaction.utils import (
+    get_effective_messages,
+    provider_cutoff,
+    provider_only,
+    read_ahead,
+    stamp_compaction_summary,
+    target_cost,
+    with_summary_text,
+)
+from ptc_agent.agent.middleware.compaction.usage_event import stamp_usage
+from ptc_agent.agent.middleware.compaction.offloading import (
+    is_idle,
+    offload_view,
+    record_offloads,
+    recorded_offloads,
+    select_offloads,
+)
+from ptc_agent.agent.middleware.compaction.window import (
+    WindowCarry,
+    WindowCoverage,
+    trim,
+    window_cut,
+)
+from ptc_agent.agent.middleware.model_resilience import as_sent
+from ptc_agent.agent.middleware.reasoning_compat import ORIGIN_KEY
+from ptc_agent.agent.transcript import TranscriptTarget, Window
+from ptc_agent.agent.transcript.classify import human_kind, is_summary_message
+from ptc_agent.agent.transcript.identity import DIGEST_VERSION
+from ptc_agent.agent.transcript.pointer import (
+    aexport_transcript,
+    shell_reads_transcripts,
+    transcript_target,
+)
+from ptc_agent.core.paths import WorkspaceLayout
+
+if TYPE_CHECKING:
+    from ptc_agent.agent.backends.sandbox import SandboxBackend
+    from ptc_agent.config.agent import AgentConfig
+
+logger = logging.getLogger(__name__)
+
+# The coverage read sits in front of a turn. It walks the thread's turn
+# boundaries, which takes tens of milliseconds; past this the trim waits for
+# the next pass rather than hold the turn.
+_COVERAGE_TIMEOUT_S = 5.0
+
+
+def _log_rebuild(decision: str, reason: str) -> None:
+    """Whether a due thread's summary rebuilds the prompt, or why it keeps the
+    tail or waits, so the rebuilds a thread misses can be counted from the
+    logs."""
+    thread_id, agent = run_ids()
+    logger.info("[Compaction] rebuild=%s reason=%s thread_id=%s agent=%s", decision, reason, thread_id, agent)
+
+
+def _log_rebuild_after(fitted: Fitted, rebuild: str | None, waits: str) -> None:
+    """Log what a send on a stale pin did with it. SystemPin takes the new
+    prompt when Claude answers a request that holds no bound thinking: always
+    after a rebuild (``rebuild`` names why), and after a kept tail whose
+    thinking the summary or the fit left unsent. A fallback's answer leaves
+    the pin as it was, and otherwise the tail keeps it (``waits`` says why)."""
+    if any(
+        isinstance(message, AIMessage) and FALLBACK_KEY in (message.response_metadata or {})
+        for message in fitted.response.result or ()
+    ):
+        _log_rebuild("deferred", "fallback")
+    elif rebuild:
+        _log_rebuild("yes", rebuild)
+    elif not fitted.sent_bound_thinking:
+        _log_rebuild("yes", "no_bound_thinking")
+    else:
+        _log_rebuild("deferred", waits)
+
+
+@contextmanager
+def _unstreamed() -> Iterator[None]:
+    """Tag the model calls made inside ``nostream``. The model node calls the
+    model with the config it finds here, so the tag reaches the call, and the
+    callbacks that bill and trace it still see it."""
+    ambient = var_child_runnable_config.get() or {}
+    token = var_child_runnable_config.set(
+        {**ambient, "tags": [*(ambient.get("tags") or ()), TAG_NOSTREAM]}
+    )
+    try:
+        yield
+    finally:
+        var_child_runnable_config.reset(token)
+
+
+def _user_texts(messages: Sequence[AnyMessage]) -> list[str]:
+    """What the user wrote in ``messages``, oldest first, with what an
+    earlier OpenAI summary among them kept: the messages Codex keeps beside
+    its item, none of the rows the runtime stamps."""
+    texts: list[str] = []
+    for message in messages:
+        if not isinstance(message, HumanMessage):
+            continue
+        if is_summary_message(message):
+            texts.extend(kept_user_texts(message))
+        elif human_kind(message) in ("plain", "steering"):
+            texts.append(message.text)
+    return texts
+
+
+def _last_ai(response: ModelResponse) -> AIMessage | None:
+    return next((m for m in reversed(response.result or ()) if isinstance(m, AIMessage)), None)
+
+
+def _log_usage(call: str, message: AIMessage | None) -> None:
+    """Log what a call the turn's stream never shows read from the cache."""
+    usage = (message.usage_metadata if message is not None else None) or {}
+    details = usage.get("input_token_details") or {}
+    logger.info(
+        "[Compaction] %s: %s in, %s cached, %s out",
+        call,
+        usage.get("input_tokens"),
+        details.get("cache_read"),
+        usage.get("output_tokens"),
+    )
+
+
+def _summary_fields(compaction: Compaction) -> dict[str, Any]:
+    """The summarize complete signal's payload, one shape for the live signal
+    and the stamp replay reads it back from."""
+    return {
+        "summary_length": len(compaction.summary.text),
+        "original_message_count": compaction.original_count,
+        "summary_text": compaction.summary.text,
+        "source": compaction.summary.source,
+    }
+
+
+class CompactionMiddleware(AgentMiddleware):
+    """Keeps an agent's context under its threshold (see the module docstring).
+
+    Every per-run value is read from graph state on each call, never kept on
+    the instance, so one instance serves concurrent runs.
+    """
+
+    state_schema = CompactionState
+
+    def __init__(
+        self,
+        summarizer: Summarizer,
+        *,
+        token_threshold: int,
+        keep_tokens: int,
+        claude_keep_tokens: int | None = None,
+        offload: OffloadSettings = OffloadSettings(),
+        backend: SandboxBackend | None = None,
+        workspace_id: str | None = None,
+        native: bool = True,
+        self_summary: bool = True,
+        receives: Callable[[Any], Callable[[Any], bool]] | None = None,
+        page_tokens: Callable[[Any], int | None] | None = None,
+        large_results_dir: str = WorkspaceLayout.LARGE_TOOL_RESULTS_DIR,
+    ) -> None:
+        """
+        Args:
+            summarizer: Writes the summaries, and counts the tokens that
+                trigger one.
+            token_threshold: The context size that triggers a summary.
+            keep_tokens: How much of the newest history a summary leaves
+                out, word for word (see ``keep_cutoff``).
+            claude_keep_tokens: The same for a Claude model, whose tokens
+                hold less text; None keeps ``keep_tokens``.
+            offload: Tier 1 settings.
+            backend: The sandbox, which holds the transcript and the
+                attachments a summary saves. None for a build without a
+                sandbox, which has neither.
+            workspace_id: The workspace the turn runs in, whose folder must
+                reach the transcript before anything points at it.
+            native: Whether a provider that can compact the conversation
+                itself does.
+            self_summary: Whether the agent's model writes a summary from its
+                own request (see ``_writes_own``).
+            receives: Which attachment blocks a call to a model is sent as
+                they are (``MultimodalStripMiddleware.receives``). The strip
+                sits inside this middleware and turns the rest into short
+                placeholders, so only these count toward the trigger and the
+                fit. None counts every attachment.
+            page_tokens: What a call to a model is charged for a PDF page
+                (``MultimodalStripMiddleware.pdf_page_tokens``), or None
+                where that is not known, which counts ``PDF_PAGE_TOKENS``.
+            large_results_dir: The thread's large-results folder, where
+                eviction saves results, and where what is too large to carry
+                past a summary is saved too (see ``carry``).
+        """
+        super().__init__()
+        self._summarizer = summarizer
+        self._token_threshold = token_threshold
+        self._keep_tokens = keep_tokens
+        self._claude_keep_tokens = (
+            keep_tokens if claude_keep_tokens is None else claude_keep_tokens
+        )
+        self._offload = offload
+        self._backend = backend
+        self._workspace_id = workspace_id
+        self._native = native
+        self._self_summary_on = self_summary
+        self._receives = receives
+        self._page_tokens = page_tokens
+        self._large_results_dir = large_results_dir
+        # The notes folder this agent's summaries name; see with_scratchpad_notes.
+        self._notes_dir: str | None = None
+        # The main agent's window; see with_window.
+        self._coverage: WindowCoverage | None = None
+        self._carries: tuple[WindowCarry, ...] = ()
+        # When a due prompt is rebuilt; see with_turn_start_rebuilds.
+        self._rebuilds: StalePinRebuilds = StalePinRebuilds()
+        # The baseline sections a call is sent; see with_baseline.
+        self._sections: Callable[[Any], Mapping[str, str]] | None = None
+
+    @classmethod
+    def for_agent(
+        cls,
+        config: AgentConfig,
+        *,
+        backend: SandboxBackend | None = None,
+        workspace_id: str | None = None,
+        receives: Callable[[Any], Callable[[Any], bool]] | None = None,
+        page_tokens: Callable[[Any], int | None] | None = None,
+        large_results_dir: str = WorkspaceLayout.LARGE_TOOL_RESULTS_DIR,
+    ) -> CompactionMiddleware | None:
+        """The middleware ``config.compaction`` describes, or None when it is off.
+
+        The ``provider_compaction`` feature is read here rather than with the
+        user's settings, so a build that resolves no user, a system insight,
+        still honors an operator who turned it off.
+        """
+        settings = config.compaction
+        if not settings.enabled:
+            return None
+        return cls(
+            Summarizer.for_agent(config),
+            token_threshold=settings.token_threshold,
+            keep_tokens=settings.keep_tokens,
+            claude_keep_tokens=settings.claude_keep_tokens,
+            offload=OffloadSettings.from_config(settings),
+            backend=backend,
+            workspace_id=workspace_id,
+            native=settings.native and config.feature_enabled("provider_compaction"),
+            self_summary=settings.self_summary,
+            receives=receives,
+            page_tokens=page_tokens,
+            large_results_dir=large_results_dir,
+        )
+
+    # =========================================================================
+    # Tier 2: every model call, summarizing first at the threshold
+    # =========================================================================
+
+    @override
+    async def awrap_model_call(
+        self,
+        request: ModelRequest,
+        handler: Callable[[ModelRequest], Awaitable[ModelResponse]],
+    ) -> ModelResponse | ExtendedModelResponse:
+        """Send the model the view, summarizing its start first once the
+        context reaches the threshold, or when the model refuses the view as
+        too long, and taking attachments out of what is kept until it fits.
+        A call made between turns (``between_turns``) is answered with what
+        it asks instead. With the turn's user on idle compaction, each answer
+        is stamped with when its request started (``stamp_request_start``)."""
+        if isinstance(self._rebuilds, TurnStartRebuilds) and self._rebuilds.idle_compaction:
+            handler = stamping(handler)
+        ensure_message_ids(request.messages)
+        between = asked()
+        if between is not None:
+            between.answer = await self._between_turns(request, handler, between.ask)
+            between.answered = True
+            return ModelResponse(result=[])
+
+        view = await self._read_view(request)
+        estimate = self._estimate(request.model)
+        reading = await context_tokens(request.state, view, estimate, functools.partial(self._ahead, request))
+        tokens = reading.tokens
+        # A stale system prompt stays while any thinking it bound is in view,
+        # so at a turn start the summary keeps none: its own request still
+        # carries the old prompt and tools, which the thinking it summarizes
+        # is checked against, and the call after it takes the new ones.
+        plan = self._rebuilds.plan(
+            request,
+            view,
+            tokens,
+            self._token_threshold,
+            time.time(),
+            first_call=bool(request.state.get("_run_first_call")),
+        )
+        refusal: Exception | None = None
+        threshold = plan.threshold or self._token_threshold
+        over = tokens >= threshold
+        if over and not plan.forced:
+            thread_id, agent = run_ids()
+            cold = tokens < self._token_threshold
+            logger.info(
+                "[Compaction] trigger=%s tokens=%d threshold=%d thread_id=%s agent=%s",
+                "cold" if cold else "threshold",
+                tokens,
+                threshold if cold else self._token_threshold,
+                thread_id,
+                agent,
+            )
+        # With notes on, a summary that keeps no turn mid-turn waits one step,
+        # sent on the prompt and cache the thread holds, which it fits under
+        # since the threshold sits under the window: the agent brings its
+        # notes up to date, asked unless a notes row it has not acted on is in
+        # view, and the next call, armed, writes the summary whatever its
+        # size, after this step's results.
+        notes_step = over and plan.carry and not plan.forced and self._notes_first(request, view)
+        if not plan.forced and (not over or notes_step):
+            ask = rebuild_notes_ask(view, self._notes_dir, request.state) if notes_step else None
+            try:
+                response = await handler(request.override(messages=[*view, ask] if ask is not None else view))
+            except Exception as exc:
+                # Matched across providers, most of which LangChain does not
+                # classify as an overflow.
+                if not is_context_overflow(exc):
+                    raise
+                thread_id, agent = run_ids()
+                logger.warning(
+                    "[Compaction] trigger=overflow thread_id=%s agent=%s: %s", thread_id, agent, exc
+                )
+                refusal = exc
+            else:
+                if not notes_step:
+                    if plan.waits is not None:
+                        _log_rebuild("deferred", plan.waits)
+                    return self._answered(request, response, reading=reading, view=view)
+                if ask is not None:
+                    response = dataclasses.replace(response, result=[ask, *response.result])
+                _log_rebuild("deferred", "notes_step")
+                return self._answered(request, response, {"_rebuild_armed": arm(request.state)}, reading=reading)
+
+        cutoff = plan.cut or self._cutoff(view, request.model)
+        fit = Fit(
+            self._token_threshold,
+            await asyncio.to_thread(lambda: estimate.counter(self._ahead(request))),
+            estimate,
+            lossless=self._native and native_kind(request.model) == "anthropic",
+        )
+        if not plan.cut and fit.lossless:
+            cutoff = fit.cut(view, cutoff, tokens, refused=refusal is not None)
+        if cutoff <= 0:
+            # All of it is the kept tail: the attachments are all that can go.
+            fitted = await fit.send(request, handler, view, refusal=refusal)
+            if plan.due:
+                _log_rebuild_after(fitted, None, "no_cut")
+            return self._answered(
+                request, fitted.response, fitted.update(request.state), spared=fitted.spared
+            )
+
+        compaction = await self._summarize(
+            request, handler, view, cutoff, rebuild=bool(plan.cut), scope=plan.scope, carried=plan.carry
+        )
+        carried = (
+            await last_step_row(view[:cutoff], backend=self._backend, folder=self._large_results_dir)
+            if plan.carry
+            else None
+        )
+        rows = [row for row in (compaction.note_row(), carried) if row is not None]
+        # A refusal of the view says nothing of what the summary made room
+        # for, so its messages are fitted by estimate like any others. The
+        # note and the carried step go into history ahead of the answer
+        # produced behind them.
+        fitted = await fit.send(request, handler, [*compaction.messages, *rows])
+        if rows:
+            fitted = fitted._replace(
+                response=dataclasses.replace(fitted.response, result=[*rows, *fitted.response.result])
+            )
+        self._stamp_summary(fitted.response, compaction)
+        if plan.due:
+            _log_rebuild_after(fitted, plan.reason if plan.cut else None, "no_turn_start_cut")
+        update = compaction.update(request.state)
+        return self._answered(
+            request, fitted.response, {**update, **fitted.update(update)}, spared=fitted.spared
+        )
+
+    def _notes_first(self, request: ModelRequest, view: list[AnyMessage]) -> bool:
+        """Whether a summary that keeps no turn mid-turn waits a step for the
+        notes: they are on, the prompt the thread is pinned to explains them
+        (a thread pinned before the scratchpad was on is treated as notes
+        off, and the summary's new prompt starts them), and the step under
+        way did not write them."""
+        return (
+            self._notes_dir is not None
+            and explains_notes(request.state, request.model, view)
+            and not last_step_wrote_notes(view, run_ids()[0])
+        )
+
+    async def _summarize(
+        self,
+        request: ModelRequest,
+        handler: Callable[[ModelRequest], Awaitable[ModelResponse]],
+        view: list[AnyMessage],
+        cutoff: int,
+        *,
+        rebuild: bool = False,
+        scope: CacheScope | None = None,
+        carried: bool = False,
+    ) -> Compaction:
+        """Summarize ``view`` before ``cutoff``, first by the agent's own
+        model: its provider compacting the conversation where it can, else the
+        model writing the summary itself (see ``_writes_own``). A provider
+        that could compact but is told not to leaves it to the summarizer, as
+        the setting says. ``rebuild`` is True for a summary that keeps no
+        turn, whose cut is the user's new message: Claude's cut stays there
+        rather than move back onto the answer before it. Whether turns stay
+        after the summary is read from what it keeps (``keeps_turns``).
+
+        ``scope`` places the cache markers of the agent's own summary call
+        (``RebuildPlan.scope``), and ``carried`` says the step it ends on
+        is carried after it (``RebuildPlan.carry``)."""
+        own: Own | None = None
+        kind = native_kind(request.model)
+        # Claude reads its block only where the kept turns can follow it.
+        cut = provider_cutoff(view, cutoff) if kind == "anthropic" and not rebuild else cutoff
+        if kind is not None and self._native and cut > 0:
+            cutoff = cut
+            own = functools.partial(
+                self._provider_summary,
+                request,
+                handler,
+                notes=self._notes_dir is not None,
+                scope=scope,
+                carried=carried,
+            )
+        elif kind is None and self._writes_own(request):
+            own = functools.partial(
+                self._self_summary,
+                request,
+                handler,
+                notes=self._notes_dir is not None,
+                scope=scope,
+                carried=carried,
+            )
+        return await self._compact(request, view, cutoff, self._transcript_target(), own, carried=carried)
+
+    def _writes_own(self, request: ModelRequest) -> bool:
+        """Whether the agent's model writes the summary from its own request.
+
+        It reads the conversation from its provider's cache, with the system
+        prompt, tools and reasoning the transcript summarizer leaves out, and
+        the summarizer stays the fallback. Its request is about half again the
+        transcript's size, so on a cache gone cold it costs that much more;
+        that is taken for the warm case, the common one. A model picked for
+        compaction is the user's choice, and writes it instead.
+        """
+        return self._self_summary_on and not is_other_model(
+            self._summarizer.model, request.model
+        )
+
+    def _cost(self, model: Any) -> Callable[[Any], int] | None:
+        """What an attachment costs on a call to ``model`` (``target_cost``)."""
+        return target_cost(
+            self._receives(model) if self._receives is not None else None,
+            self._page_tokens(model) if self._page_tokens is not None else None,
+        )
+
+    def _estimate(self, model: Any) -> Estimate:
+        """How what no call to ``model`` measured is counted (``counter_for``),
+        its attachments as the model is charged for them."""
+        return estimate_for(model, self._summarizer.counter, self._cost(model))
+
+    def _ahead(self, request: ModelRequest) -> list[Any]:
+        """What ``request`` sends ahead of its messages once the middlewares
+        further in have run (``sent_ahead``): the baseline block appended to
+        its system message too, where the stack has one (``with_baseline``).
+        Built off the loop, since every tool schema is converted and
+        serialized."""
+        return sent_ahead(request, block_of(self._baseline_sections(request.state)))
+
+    def _baseline_sections(self, state: Any) -> Mapping[str, str]:
+        """The baseline's sections a call with ``state`` is sent (``with_baseline``)."""
+        return self._sections(state) if self._sections is not None else {}
+
+    def _cutoff(self, view: list[AnyMessage], model: Any) -> int:
+        """Where a summary of ``view`` for ``model`` ends (``keep_cutoff``)."""
+        tokens = keep_tokens_for(
+            model, self._keep_tokens, self._claude_keep_tokens, self._token_threshold
+        )
+        return keep_cutoff(view, tokens=tokens, estimate=self._estimate(model))
+
+    def _keep_tail_cut(self, view: list[AnyMessage], model: Any) -> int:
+        """Where Claude's own summary keeping the tail cuts ``view``: on an
+        answer, whose request wrote the cache entry that summary reads."""
+        return provider_cutoff(view, self._cutoff(view, model))
+
+    async def _between_turns(
+        self,
+        request: ModelRequest,
+        handler: Callable[[ModelRequest], Awaitable[ModelResponse]],
+        ask: Ask,
+    ) -> Compaction | HumanMessage | dict[str, int] | int | None:
+        """What a call between turns asks for (see ``between_turns``)."""
+        if isinstance(ask, Parts):
+            # Ahead of the view: the parts are of what is sent before it.
+            return await ahead_parts(
+                request.system_message,
+                request.tools,
+                self._baseline_sections(request.state),
+                model=request.model,
+                counter=self._estimate(request.model).counter,
+            )
+        view = await self._read_view(request)
+        if isinstance(ask, Measure):
+            ahead = functools.partial(self._ahead, request)
+            return (await context_tokens(request.state, view, self._estimate(request.model), ahead)).tokens
+        if isinstance(ask, HandOff):
+            return await self._hand_off(request, handler, view, notes=self._notes_dir is not None)
+        if isinstance(ask, WriteBrief):
+            return await self._brief(request, handler, view, ask)
+        if isinstance(ask, IdleCompact):
+            return await self._idle(request, handler, view)
+        # A due thread's summary keeps no turns here too, so the next turn
+        # takes the new prompt.
+        plan = self._rebuilds.between_turns(request, view, time.time())
+        if plan.cut:
+            compaction = await self._summarize(
+                request, handler, view, plan.cut, rebuild=True, scope=plan.scope
+            )
+            _log_rebuild("yes", plan.reason)
+            return compaction
+        cutoff = self._cutoff(view, request.model)
+        if cutoff <= 0:
+            raise ValueError(NOTHING_TO_COMPACT)
+        compaction = await self._summarize(request, handler, view, cutoff)
+        if plan.waits is not None:
+            _log_rebuild("deferred", plan.waits)
+        return compaction
+
+    async def _idle(
+        self,
+        request: ModelRequest,
+        handler: Callable[[ModelRequest], Awaitable[ModelResponse]],
+        view: list[AnyMessage],
+    ) -> Compaction:
+        """The summary of a thread idle after a turn (``TurnStartRebuilds.idle``),
+        written only by the provider from its cache: the summarizer would read
+        the whole history at the uncached rate, which is the cost this runs
+        early to avoid (``idle_cut`` says where, and when it no longer may).
+
+        Raises:
+            IdleSkipped: Naming why nothing is summarized.
+            NoOwnSummary: The provider wrote no summary.
+        """
+        if not self._native or native_kind(request.model) != "anthropic":
+            raise IdleSkipped("not_native")
+        ahead = functools.partial(self._ahead, request)
+        reading = await context_tokens(request.state, view, self._estimate(request.model), ahead)
+        plan = self._rebuilds.idle(request, view, reading.tokens, self._token_threshold)
+        cut = idle_cut(request, view, plan, self._keep_tail_cut(view, request.model), time.time())
+        thread_id, agent = run_ids()
+        logger.info(
+            "[Compaction] idle=fire kind=%s tokens=%d threshold=%d thread_id=%s agent=%s",
+            "I1" if plan.cut else "I2",
+            reading.tokens,
+            self._token_threshold,
+            thread_id,
+            agent,
+        )
+        own = functools.partial(self._provider_summary, request, handler, notes=self._notes_dir is not None)
+        compaction = await self._compact(request, view, cut, self._transcript_target(), own, own_only=True)
+        if plan.cut:
+            _log_rebuild("yes", plan.reason)
+        return compaction
+
+    async def _brief(
+        self,
+        request: ModelRequest,
+        handler: Callable[[ModelRequest], Awaitable[ModelResponse]],
+        view: list[AnyMessage],
+        ask: WriteBrief,
+    ) -> Compaction:
+        """The view through its last reply written out for a model that has
+        seen none of it (``WriteBrief``): by this model as text from its own
+        request where it reads the thread cheaply there (``_reads_cheaply``),
+        never as its provider's compaction, which no other model can read;
+        else, or when it writes none, by the compaction model; past that the
+        reader is handed the history itself.
+
+        Raises:
+            ValueError: When the view holds no reply to summarize.
+        """
+        cut = brief_cut(view)
+        if cut <= 0:
+            raise ValueError(NOTHING_TO_COMPACT)
+        own = (
+            functools.partial(
+                self._self_summary, request, handler, notes=self._notes_dir is not None, kind="brief"
+            )
+            if ask.by_own and self._reads_cheaply(request, view)
+            else None
+        )
+        return await self._compact(
+            request, view, cut, self._transcript_target(), own, brief_room=ask.room
+        )
+
+    def _reads_cheaply(self, request: ModelRequest, view: list[AnyMessage]) -> bool:
+        """Whether this model reads ``view`` from its own request at little
+        cost: the view opens on a summary only its provider can read, which
+        no other model can write out, and this model is sent it; the user's
+        subscription pays for the read; or its prompt cache is warm."""
+        client = request.model.bound if isinstance(request.model, RunnableBindingBase) else request.model
+        if view and provider_only(view[0]) and replays(view[0], client):
+            return True
+        if (getattr(client, "metadata", None) or {}).get("billing_type") == "oauth":
+            return True
+        return not self._rebuilds.cold(request, view, time.time())
+
+    @staticmethod
+    async def _hand_off(
+        request: ModelRequest,
+        handler: Callable[[ModelRequest], Awaitable[ModelResponse]],
+        view: list[AnyMessage],
+        *,
+        notes: bool,
+    ) -> HumanMessage | None:
+        """The view's opening summary written out by the agent's model, when
+        it is one only that model's provider can read, else None.
+
+        The summary goes out as the provider's own answer (``adopt``, inside
+        ``handler``), from the provider's cache, and the model writes it out
+        as text. Tools stay bound so the prefix is the one the cache holds;
+        none may be called. Only this model reading that answer can write it,
+        so a failure is never moved to a fallback model or retried without it.
+        """
+        head = view[0] if view and is_summary_message(view[0]) else None
+        if not isinstance(head, HumanMessage) or not provider_only(head):
+            return None
+        prompt = summary_prompt("handoff", keeps_turns(view[1:]), notes)
+        with as_sent():
+            response = await handler(
+                request.override(
+                    messages=[head, HumanMessage(prompt)],
+                    tool_choice="none",
+                )
+            )
+        message = _last_ai(response)
+        _log_usage("hand-off", message)
+        text = message.text.strip() if message is not None and not message.tool_calls else ""
+        written = with_summary_text(head, text) if text else None
+        if written is None:
+            raise ValueError("the model wrote no hand-off summary")
+        return written
+
+    async def _compact(
+        self,
+        request: ModelRequest,
+        view: list[AnyMessage],
+        cutoff: int,
+        transcript: TranscriptTarget | None,
+        own: Own | None = None,
+        *,
+        carried: bool = False,
+        own_only: bool = False,
+        brief_room: int | None = None,
+    ) -> Compaction:
+        """Summarize ``view`` before ``cutoff``, by ``own`` when given,
+        this agent's model being the fallback unless ``own_only`` or a
+        ``brief_room`` (see ``Summarizer.compact``).
+
+        Start is outside the try, so a start that fails opened no window. A
+        cancellation still emits error before it propagates: otherwise the
+        stream would keep an orphan start and its compaction window open.
+        """
+        self._emit_context_signal("summarize", "start")
+        try:
+            compaction = await self._summarizer.compact(
+                request.messages,
+                view,
+                cutoff,
+                backend=self._backend,
+                workspace_id=self._workspace_id,
+                transcript=transcript,
+                fallback=request.model,
+                notes_dir=self._notes_dir,
+                window=Window.of(request.state),
+                # Its own action: a client built before the count reads any
+                # summarize signal but start as the summary's end.
+                progress=lambda tokens: self._emit_context_signal(
+                    "summary_progress", "progress", summary_tokens=tokens
+                ),
+                own=own,
+                carried=carried,
+                own_only=own_only,
+                brief_room=brief_room,
+            )
+        except BaseException as e:
+            self._emit_context_signal("summarize", "error", error=str(e))
+            raise
+        self._emit_context_signal("summarize", "complete", **_summary_fields(compaction))
+        return compaction
+
+    @staticmethod
+    async def _provider_summary(
+        request: ModelRequest,
+        handler: Callable[[ModelRequest], Awaitable[ModelResponse]],
+        to_summarize: list[AnyMessage],
+        kept: bool,
+        *,
+        notes: bool,
+        scope: CacheScope | None = None,
+        carried: bool = False,
+    ) -> NativeAnswer:
+        """The agent's provider compacting ``to_summarize`` itself, with the
+        summary prompt in place of its own where it takes one (Claude), the
+        one for a summary that keeps no turn when ``kept`` is False.
+
+        Sent through ``handler`` so the request is the conversation's own:
+        the same system prompt, tools and thinking, which its cache and the
+        thinking in the kept turns are checked against. It goes to this model
+        as sent: the kept thinking stays valid only through a compaction its
+        own model writes, and the summarizer is the fallback here. It stays
+        out of the turn's message stream, where its reply would read as the
+        answer. OpenAI's goes after the user's own messages it summarized.
+        ``scope`` places its cache markers (``cache_markers.cache_scope``).
+        """
+        settings = compaction_settings(
+            request.model,
+            request.model_settings,
+            summary_prompt("native", kept, notes, carried=carried),
+        )
+        with as_sent(), _unstreamed(), cache_scope(scope):
+            response = await handler(
+                request.override(messages=to_summarize, model_settings=settings)
+            )
+        message = _last_ai(response)
+        _log_usage("provider summary", message)
+        answer = native_answer(message, _user_texts(to_summarize))
+        if message is None or answer is None:
+            stop = (message.response_metadata or {}).get("stop_reason") if message else None
+            raise ValueError(f"no compaction (stop reason {stop})")
+        return NativeAnswer(answer, (message.response_metadata or {}).get(ORIGIN_KEY))
+
+    @staticmethod
+    async def _self_summary(
+        request: ModelRequest,
+        handler: Callable[[ModelRequest], Awaitable[ModelResponse]],
+        to_summarize: list[AnyMessage],
+        kept: bool,
+        *,
+        notes: bool,
+        scope: CacheScope | None = None,
+        carried: bool = False,
+        kind: Literal["self", "brief"] = "self",
+    ) -> str:
+        """The agent's model writing the summary of ``to_summarize`` as text,
+        asked in the last user message of its own request: for itself, or as
+        a brief for another model (``kind``).
+
+        Sent through ``handler`` with the turn's tools and settings unchanged,
+        so the request opens on the prefix the provider has cached; none may
+        be called. It goes to this model as sent: a fallback model would read
+        none of it from a cache, and the summarizer is the fallback here. It
+        stays out of the turn's message stream. A summary that stops before
+        its closing line was cut off, and counts as none. ``scope`` places
+        its cache markers (``cache_markers.cache_scope``).
+        """
+        with as_sent(), _unstreamed(), cache_scope(scope):
+            response = await handler(
+                request.override(
+                    messages=[
+                        *to_summarize,
+                        HumanMessage(summary_prompt(kind, kept, notes, carried=carried)),
+                    ]
+                )
+            )
+        message = _last_ai(response)
+        _log_usage("self summary", message)
+        if message is None or message.tool_calls:
+            raise ValueError("no reply" if message is None else "called a tool")
+        text = finished_summary(summary_text(message))
+        if text is None:
+            stop = (message.response_metadata or {}).get("stop_reason")
+            raise ValueError(f"no closing line (stop reason {stop})")
+        return text
+
+    @staticmethod
+    def _stamp_summary(response: ModelResponse, compaction: Compaction) -> None:
+        """Stamp the summary on the response that answered from it, for
+        replay to show where it fired: live, its signal comes right before
+        this response streams."""
+        for msg in reversed(response.result or ()):
+            if isinstance(msg, AIMessage):
+                stamp_compaction_summary(
+                    msg, compaction.event["summary_message"].id, _summary_fields(compaction)
+                )
+                return
+
+    def _answered(
+        self,
+        request: ModelRequest,
+        response: ModelResponse,
+        update: dict[str, Any] | None = None,
+        *,
+        spared: int = 0,
+        reading: ContextReading | None = None,
+        view: list[AnyMessage] | None = None,
+    ) -> ExtendedModelResponse:
+        """``response``, with ``update`` and the state the next call reads:
+        the context size this call measured, less the ``spared`` tokens of
+        attachments ``update`` takes out of the next one, and when the model
+        answered, which the next turn's Tier 1 measures its pause from.
+        ``reading`` is the trigger's reading of the view this call was sent
+        as it was, which its growth is stamped from, and ``view`` that view;
+        a call that was sent a summary or a fitted view has neither. The run's
+        first call is past once it answers (see ``abefore_agent``), an arm lasts one
+        call (see ``rebuild``) unless ``update`` sets it again, and the main agent's
+        final answer leaves the idle clock (``idle.idle_clock``)."""
+        answer, input_tokens, output_tokens = self._extract_token_usage(request, response, reading)
+        opened = {"_run_first_call": False} if request.state.get("_run_first_call") else {}
+        disarmed = {"_rebuild_armed": None} if request.state.get("_rebuild_armed") else {}
+        cached_input = max(input_tokens - spared, 0)
+        if answer is not None and isinstance(self._rebuilds, TurnStartRebuilds):
+            previous = request.state.get(LAST_ANSWER_KEY)
+            opened[LAST_ANSWER_KEY] = answer_reading(
+                answer, self._token_threshold, request.model, previous, self._rebuilds
+            )
+            idle = idle_clock(
+                request,
+                answer,
+                view,
+                cached_input + output_tokens,
+                rebuilds=self._rebuilds,
+                native=self._native,
+                tail_cut=lambda whole: self._keep_tail_cut(whole, request.model),
+            )
+            if idle is not None:
+                opened["_idle_clock"] = idle
+        return ExtendedModelResponse(
+            model_response=response,
+            command=Command(
+                update={
+                    **disarmed,
+                    **(update or {}),
+                    **opened,
+                    "_cached_input_tokens": cached_input,
+                    "_cached_output_tokens": output_tokens,
+                    "_last_model_response_at": time.time(),
+                }
+            ),
+        )
+
+    def _extract_token_usage(
+        self,
+        request: ModelRequest,
+        response: ModelResponse,
+        reading: ContextReading | None = None,
+    ) -> tuple[AIMessage | None, int, int]:
+        """The newest AI message that reports usage and its (input, output)
+        tokens, or (None, 0, 0) when none does. The message is stamped with
+        what replay shows of its call and emitted to the frontend as replay
+        will read it (``stamp_usage``), and with its growth from ``reading``."""
+        usage = reported_usage(response)
+        if usage is None:
+            return (None, 0, 0)
+        msg, input_tokens, output_tokens = usage
+        logger.debug("[Compaction] Token usage: input=%d, output=%d", input_tokens, output_tokens)
+        # A fallback's answer came from another model than ``request``'s, whose
+        # window is not known here, so it carries none.
+        fallback = FALLBACK_KEY in (msg.response_metadata or {})
+        limit = None if fallback else max_input_tokens(request.model)
+        fields = stamp_usage(msg, self._token_threshold, limit)
+        if reading is not None:
+            stamp_context_growth(msg, reading, input_tokens)
+        if fields is not None:
+            self._emit_context_signal("token_usage", "complete", **fields)
+        return (msg, input_tokens, output_tokens)
+
+    # =========================================================================
+    # Tier 1: trimming old tool args and Read results after a long pause
+    # =========================================================================
+
+    @override
+    async def abefore_agent(self, state: Any, runtime: Any) -> dict[str, Any] | None:
+        """Tier 1 when the turn starts after a long pause, then the window's
+        trim. A resume after an interrupt does not pass through here, since
+        the graph picks up where it stopped; an orchestrator re-entry does."""
+        update = await self._offload_idle(state)
+        trimmed = await self._trim({**state, **update})
+        # Only a fresh run passes through here, so its first model call is
+        # told apart from a resume's (see ``turn_start_cut``).
+        opened = {"_run_first_call": True} if self._rebuilds.reads_first_call else {}
+        return {**update, **(trimmed or {}), **opened} or None
+
+    async def _offload_idle(self, state: Mapping[str, Any]) -> dict[str, Any]:
+        """Tier 1, once per turn and only when the model last answered more
+        than the idle threshold ago: by then the provider's prompt cache has
+        expired, so hiding part of the prefix costs no cache hit, while doing
+        it mid-turn would throw a warm one away. An argument is hidden only
+        once the transcript holding it is saved where the workspace can read
+        it, since that is then its one copy."""
+        if not is_idle(state, self._offload, time.time()):
+            return {}
+        messages = state["messages"]
+        effective = get_effective_messages(messages, state.get("_summarization_event"))
+        args, reads = select_offloads(effective, self._offload, recorded_offloads(state))
+        if args and await aexport_transcript(
+            self._backend,
+            self._transcript_target(),
+            messages,
+            workspace_id=self._workspace_id,
+            window=Window.of(state),
+        ) is None:
+            args = set()
+        if args:
+            self._emit_context_signal("offload", "complete", kind="args", offloaded_args=len(args))
+        if reads:
+            self._emit_context_signal(
+                "offload", "complete", kind="reads", offloaded_reads=len(reads)
+            )
+        return record_offloads(state, args, reads)
+
+    async def _trim(self, state: Mapping[str, Any]) -> dict[str, Any] | None:
+        """The window's trim (see ``window``), or None while it may not:
+        without the server to ask (any stack but the main agent's, see
+        ``with_window``), before a summary with an anchor, or while the
+        server's slices do not hold exactly the messages it would drop, in
+        which case the update keeps the refusal.
+
+        A refusal is kept in the checkpoint with the anchor and cut it was
+        for, and the digest it was checked under, and not asked again until
+        one of them moves: a thread whose slices do not match pays for the
+        check once per summary, not per turn, and one backfilled since trims
+        after its next summary.
+        """
+        if self._coverage is None:
+            return None
+        messages = state["messages"]
+        event = state.get("_summarization_event")
+        cut = window_cut(messages, event)
+        if cut <= 0:
+            return None
+        asked = {"anchor": event["anchor_message_id"], "cut": cut, "digest": DIGEST_VERSION}
+        if state.get("_window_refused") == asked:
+            return None
+        try:
+            async with asyncio.timeout(_COVERAGE_TIMEOUT_S):
+                head = await self._coverage(Window.of(state), messages[:cut])
+        except Exception:  # noqa: BLE001 - an unanswered check only delays the trim
+            logger.warning("[Compaction] window coverage unread", exc_info=True)
+            return None
+        if head is None:
+            logger.info(
+                "[Compaction] window waits for the next summary: slices do not "
+                "hold the %d messages before the cut",
+                cut,
+            )
+            return {"_window_refused": asked}
+        logger.info(
+            "[Compaction] window trimmed %d messages, runs up to %d", cut, head.runs
+        )
+        return trim(state, cut, self._carries, head=head)
+
+    def with_window(
+        self, coverage: WindowCoverage, carries: Sequence[WindowCarry] = ()
+    ) -> CompactionMiddleware:
+        """This middleware, trimming the main agent's checkpoint to its window.
+
+        ``coverage`` asks the server whether turn slices hold the runs a trim
+        would drop; ``carries`` keep what other readers counted in them. For
+        the main agent's stack only: a subagent's run is bounded, and its
+        transcript reads its namespace's whole history.
+        """
+        main = copy.copy(self)
+        main._coverage = coverage
+        main._carries = tuple(carries)
+        return main
+
+    def with_turn_start_rebuilds(self, rebuilds: TurnStartRebuilds) -> CompactionMiddleware:
+        """This middleware, rebuilding a due prompt as ``rebuilds`` says
+        rather than only at a turn start once the pin is stale. For the main
+        agent's stack only: a subagent's run is bounded.
+        """
+        main = copy.copy(self)
+        main._rebuilds = rebuilds
+        return main
+
+    def with_baseline(self, sections: Callable[[Any], Mapping[str, str]]) -> CompactionMiddleware:
+        """This middleware, counting the baseline block a call is sent,
+        ``sections`` of the state joined, where nothing measured the
+        context: the context stack appends it to the system message further
+        in, so the request this middleware reads does not hold it yet. A
+        ``Parts`` ask counts each under the part of the context it belongs
+        to. For the main agent's stack, whose baseline sits inside
+        compaction.
+        """
+        main = copy.copy(self)
+        main._sections = sections
+        return main
+
+    def with_scratchpad_notes(self, notes_dir: str) -> CompactionMiddleware:
+        """This middleware, with each summary naming ``notes_dir``'s files.
+
+        For the main agent's stack only: a subagent compacts its own run,
+        which keeps no notes, so its stack holds the plain instance. A copy
+        is enough because the instance keeps nothing per invocation.
+        """
+        main = copy.copy(self)
+        main._notes_dir = notes_dir
+        return main
+
+    async def view(self, messages: list[AnyMessage], state: Mapping[str, Any]) -> list[AnyMessage]:
+        """What this agent's model is sent of ``messages``: what the summary
+        trigger counts, and so what the scratchpad's fill counts too."""
+        return await offload_view(
+            messages,
+            state,
+            max_length=self._offload.max_length,
+            transcript=self._transcript_target(),
+            shell=shell_reads_transcripts(self._backend),
+        )
+
+    async def _read_view(self, request: ModelRequest) -> list[AnyMessage]:
+        """The view of ``request``'s messages, read ahead for the counts
+        taken of it (``read_ahead``)."""
+        view = await self.view(request.messages, request.state)
+        await read_ahead(view)
+        return view
+
+    def _transcript_target(self) -> TranscriptTarget | None:
+        """This agent's transcript, or None where nothing serves one."""
+        try:
+            configurable = get_config().get("configurable", {})
+        except RuntimeError:
+            return None
+        return transcript_target(
+            self._backend,
+            configurable.get("thread_id"),
+            str(configurable.get("checkpoint_ns") or ""),
+        )
+
+    # =========================================================================
+    # Events
+    # =========================================================================
+
+    def _emit_context_signal(self, action: str, signal: str, **kwargs: Any) -> None:
+        """Emit a context_window event via the stream writer.
+
+        Args:
+            action: Action discriminator ("summarize", "summary_progress",
+                "offload", "token_usage")
+            signal: Signal type ("start", "progress", "complete", or "error")
+            **kwargs: Additional payload fields (summary_length, error, etc.)
+        """
+        try:
+            stream_writer = get_stream_writer()
+            payload: dict[str, Any] = {
+                "type": "context_window",
+                "action": action,
+                "signal": signal,
+            }
+            # Include checkpoint_ns for agent identification by streaming handler
+            try:
+                checkpoint_ns = get_config().get("configurable", {}).get("checkpoint_ns", "")
+                if checkpoint_ns:
+                    payload["checkpoint_ns"] = checkpoint_ns
+            except RuntimeError:
+                pass
+            payload.update(kwargs)
+            stream_writer(payload)
+            if signal == "error":
+                logger.warning(
+                    "[Compaction] Emitted %s error signal: %s", action, kwargs.get("error")
+                )
+            else:
+                logger.debug("[Compaction] Emitted %s %s signal", action, signal)
+        except Exception as e:
+            logger.debug("Could not emit context_window %s/%s signal: %s", action, signal, e)

@@ -1,0 +1,225 @@
+import { useMutation, useQueryClient, type QueryClient } from '@tanstack/react-query';
+import { appearancePatch, readAccountCardStyle, readAccountTheme } from '../lib/appearancePreference';
+import { SAVED_DASHBOARDS_KEY } from '../lib/dashboards/saved';
+import { MOVED_MODEL_KEYS, threadsMoved } from '../lib/modelPreferences';
+import { readOtherPreference } from '../lib/otherPreference';
+import { preferenceWriteLock } from '../lib/preferenceLock';
+import { announcePreferencesChanged } from '../lib/preferencesChannel';
+import { queryKeys } from '../lib/queryKeys';
+import { clearPreferences, getPreferences, updatePreferences } from '../pages/Dashboard/utils/api';
+import type { UserPreferences } from '../types/api';
+
+/** Every preference write shares one mutation identity, so a save indicator can
+ *  watch the write rather than the component that issued it. */
+export const PREFERENCE_MUTATION_KEY = ['user-preferences'] as const;
+
+/** Every request that changes the preferences row waits its turn here. */
+const PREFERENCE_SCOPE = { id: 'user-preferences' };
+
+/** Columns the server merges recursively (`jsonb_deep_merge`). Only
+ *  `model_preference` does: its `profiles` bag is keyed by model name, so a
+ *  patch for one model has to leave its siblings standing. */
+const DEEP_COLUMNS = new Set(['model_preference']);
+
+function isObject(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+/** Mirrors `jsonb_deep_merge`: a null deletes its key at whatever depth it
+ *  appears, two objects merge, anything else replaces. */
+function deepMerge(
+  base: Record<string, unknown>,
+  patch: Record<string, unknown>,
+): Record<string, unknown> {
+  const merged = { ...base };
+  for (const [key, value] of Object.entries(patch)) {
+    if (value === null) delete merged[key];
+    else if (isObject(merged[key]) && isObject(value)) merged[key] = deepMerge(merged[key], value);
+    else merged[key] = value;
+  }
+  return merged;
+}
+
+/** Mirrors `(existing - nulls) || updates` for the columns the server merges
+ *  one level deep: a nested bag written under one of their keys replaces the
+ *  stored one whole. */
+function shallowMerge(
+  base: Record<string, unknown>,
+  patch: Record<string, unknown>,
+): Record<string, unknown> {
+  const merged = { ...base };
+  for (const [key, value] of Object.entries(patch)) {
+    if (value === null) delete merged[key];
+    else merged[key] = value;
+  }
+  return merged;
+}
+
+/** The clear the server performs alongside ours: a moved key dropped from
+ *  `model_preference` is dropped from its pre-move copy too, or the reader
+ *  answers the next question with the value we just cleared. */
+function withMovedDeletes(patch: Partial<UserPreferences>): Partial<UserPreferences> {
+  const model = patch.model_preference;
+  if (!isObject(model)) return patch;
+  const cleared = Object.keys(model).filter((k) => model[k] === null && MOVED_MODEL_KEYS.has(k));
+  if (cleared.length === 0) return patch;
+  const legacy = isObject(patch.other_preference) ? patch.other_preference : {};
+  return {
+    ...patch,
+    other_preference: {
+      ...Object.fromEntries(cleared.map((k) => [k, null])),
+      ...legacy,
+    } as UserPreferences['other_preference'],
+  };
+}
+
+/** Request options that ride a write without being columns of the row.
+ *  `apply_default_to` answers one default change and is never stored, so
+ *  predicting it into the cache would show a setting nobody saved; nor is
+ *  `expect_other_preference`, the values a whole-key write was built from. */
+const ONE_SHOT_KEYS = new Set(['apply_default_to', 'expect_other_preference']);
+
+/** What the row will look like once the server has applied this patch. */
+function mergePreferences(
+  previous: UserPreferences,
+  patch: Partial<UserPreferences>,
+): UserPreferences {
+  const next = { ...previous } as Record<string, unknown>;
+  for (const [column, value] of Object.entries(withMovedDeletes(patch))) {
+    if (ONE_SHOT_KEYS.has(column)) continue;
+    if (!isObject(value)) {
+      next[column] = value;
+      continue;
+    }
+    const base = isObject(next[column]) ? next[column] : {};
+    next[column] = DEEP_COLUMNS.has(column) ? deepMerge(base, value) : shallowMerge(base, value);
+  }
+  return next as UserPreferences;
+}
+
+/**
+ * Mutation hook for updating user preferences.
+ *
+ * The cache moves on `onMutate`, not on the response: every control that writes
+ * a preference reads it back from this one entry, so a control that mirrored
+ * the click in its own state would keep showing a value a failed write never
+ * stored, and a scheduled turn would run the stored one. Rolling back here is
+ * what lets those controls stay derived.
+ *
+ * `scope` serializes writes against the single entry. Two in flight at once
+ * finish in either order, and the earlier-issued one landing last would replace
+ * the whole entry with a snapshot that predates the newer write.
+ */
+export function useUpdatePreferences() {
+  const queryClient = useQueryClient();
+  const key = queryKeys.user.preferences();
+  return useMutation({
+    mutationKey: PREFERENCE_MUTATION_KEY,
+    scope: PREFERENCE_SCOPE,
+    mutationFn: updatePreferences as (prefs: Partial<UserPreferences>) => Promise<UserPreferences>,
+    onMutate: async (patch: Partial<UserPreferences>) => {
+      await queryClient.cancelQueries({ queryKey: key });
+      const previous = queryClient.getQueryData<UserPreferences>(key);
+      if (previous) queryClient.setQueryData(key, mergePreferences(previous, patch));
+      return { previous };
+    },
+    // Deliberately no write of the response over the entry. `scope` serializes the requests but not
+    // `onMutate`, so every queued write has already moved the cache by the time
+    // the first response lands; writing that response over the entry drops the
+    // later patches until each one lands in turn. A list-valued control that
+    // recomputes from the cache inside that window (fallback models, starred)
+    // would send a list with the newer edit missing, which is a permanent loss
+    // rather than a flicker.
+    onSettled: (result, error) => {
+      // A moved thread may be open in a view kept alive behind this one, and
+      // each reads its model back from its thread row: a stale row would name
+      // the old model on its next send and move the thread back. Every write
+      // can move them (a cleared default, onboarding), so the refresh is here,
+      // and a failed one too, which may have committed with its response lost.
+      if (error || (threadsMoved(result) ?? 0) > 0) {
+        void queryClient.invalidateQueries({ queryKey: queryKeys.threads.all });
+      }
+      // Only the last write in flight can know the cache and the row agree.
+      // Inside onSettled this mutation is still counted, so 1 means it is last.
+      if (queryClient.isMutating({ mutationKey: PREFERENCE_MUTATION_KEY }) === 1) {
+        queryClient.invalidateQueries({ queryKey: key });
+      }
+    },
+    onError: (_error, _patch, context) => {
+      // Same guard, same reason: `previous` is this mutation's snapshot, so
+      // restoring it over a queued write's optimistic patch undoes an edit the
+      // user just made and the server never rejected. With something newer in
+      // flight, leave the cache standing and let the last settle reconcile it.
+      const last = queryClient.isMutating({ mutationKey: PREFERENCE_MUTATION_KEY }) === 1;
+      if (context?.previous && last) queryClient.setQueryData(key, context.previous);
+    },
+  });
+}
+
+/**
+ * The row a reset saves back from: the server's, since another tab may have
+ * changed the list since this one last read it, or this tab's copy when the
+ * read fails.
+ */
+async function latestRow(queryClient: QueryClient): Promise<UserPreferences | null | undefined> {
+  const queryKey = queryKeys.user.preferences();
+  try {
+    return await queryClient.fetchQuery({ queryKey, queryFn: getPreferences as () => Promise<UserPreferences>, staleTime: 0 });
+  } catch {
+    return queryClient.getQueryData<UserPreferences | null>(queryKey);
+  }
+}
+
+/** The waits before each try of the save back that follows a reset. */
+const SAVE_BACK_WAITS_MS = [0, 300, 1200];
+
+async function saveBack(keep: Record<string, unknown>): Promise<void> {
+  for (const wait of SAVE_BACK_WAITS_MS) {
+    if (wait) await new Promise((resolve) => setTimeout(resolve, wait));
+    try {
+      await updatePreferences({ other_preference: keep });
+      return;
+    } catch {
+      // Tried again, then left: the reset itself is done.
+    }
+  }
+}
+
+/** Deletes the preferences row once every write issued before it has landed.
+ *  Sent past them, a write the server takes after the delete inserts a fresh
+ *  row holding its keys, and the reset leaves that value stored. It carries no
+ *  key, so it never counts as one of the writes a save status watches.
+ *
+ *  The look (style and theme) and the dashboards the user set live in the same
+ *  row but are not part of what a reset clears, so they are saved back before
+ *  the reset settles, and the refetch after it finds them still there. The
+ *  list is the only record of which pages the server keeps a copy of: cleared,
+ *  every one of them would go on being kept with no way left to remove it, so
+ *  the save back is tried again before it is given up. One that keeps failing
+ *  leaves the reset done, the look at its defaults and the list empty.
+ *
+ *  The delete and the save back hold the lock whole-key writes take
+ *  (`preferenceWriteLock`), so another tab's change to the list waits for the
+ *  list to be back rather than landing between the two and being written
+ *  over. */
+export function useClearPreferences() {
+  const queryClient = useQueryClient();
+  const reset = useMutation({
+    scope: PREFERENCE_SCOPE,
+    mutationFn: async () => {
+      const row = await latestRow(queryClient);
+      const look = appearancePatch({ cardStyle: readAccountCardStyle(row), theme: readAccountTheme(row) });
+      const dashboards = readOtherPreference(row, SAVED_DASHBOARDS_KEY);
+      const keep: Record<string, unknown> = { ...(look?.other_preference as Record<string, unknown> | undefined) };
+      if (dashboards) keep[SAVED_DASHBOARDS_KEY] = dashboards;
+      const cleared = await clearPreferences();
+      if (Object.keys(keep).length) await saveBack(keep);
+      // Other tabs still hold what the reset cleared, the data access an app
+      // was allowed among it, until they read the row again.
+      announcePreferencesChanged();
+      return cleared;
+    },
+  });
+  const { mutateAsync } = reset;
+  return useMutation({ mutationFn: () => preferenceWriteLock(() => mutateAsync()) });
+}

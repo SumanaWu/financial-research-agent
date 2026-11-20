@@ -1,0 +1,328 @@
+# Modified on 2026-11-17 for local study distribution; display names and nonessential project links adjusted. See MODIFICATIONS.md.
+"""Tests for options_mcp_server: envelope conformance, ordering, errors.
+
+Covers the standard agent-facing envelope (AGENT_CONTRACT.md): canonical
+`symbol`/`interval`, currency/timezone derived from the UNDERLYING instrument,
+ascending `data`, interval validation, and machine-code errors. Upstream
+marketbridge-data fetches are mocked — no live network.
+"""
+
+from __future__ import annotations
+
+from unittest.mock import AsyncMock, patch
+
+import pytest
+
+from src.data_client.base import FetchResult
+
+from .conftest import assert_error, assert_ok_envelope
+
+_MOD = "plugins.finworkbench_market_data.options_mcp_server"
+
+_OPT = "O:AAPL260618C00220000"
+
+_CONTRACT = {
+    "ticker": _OPT,
+    "underlying_ticker": "AAPL",
+    "contract_type": "call",
+    "exercise_style": "american",
+    "expiration_date": "2026-06-18",
+    "strike_price": 220.0,
+    "shares_per_contract": 100,
+    "primary_exchange": "BATO",
+}
+
+# fetch_options_prices returns already-normalized display rows, DESCENDING.
+_OPT_ROWS_DESC = [
+    {"date": "2025-01-03", "open": 5.1, "high": 5.5, "low": 5.0, "close": 5.4, "volume": 300},
+    {"date": "2025-01-02", "open": 5.0, "high": 5.3, "low": 4.9, "close": 5.1, "volume": 250},
+]
+
+_SNAP = {
+    "ticker": _OPT,
+    "name": "AAPL 260618 C 220",
+    "market_status": "open",
+    "session": {"open": 5.0, "high": 5.5, "low": 4.9, "close": 5.4, "volume": 1200},
+    "last_quote": {"bid": 5.3, "ask": 5.5, "midpoint": 5.4},
+    "last_trade": {"price": 5.4, "size": 3},
+}
+
+
+def _ensure(mod, value: bool):
+    return patch.object(mod._marketbridge, "ensure", new=AsyncMock(return_value=value))
+
+
+# ---------------------------------------------------------------------------
+# get_options_chain
+# ---------------------------------------------------------------------------
+
+class TestGetOptionsChain:
+    @pytest.mark.asyncio
+    async def test_no_marketbridge_client(self):
+        import plugins.finworkbench_market_data.options_mcp_server as mod
+
+        with _ensure(mod, False):
+            result = await mod.get_options_chain("AAPL")
+
+        assert_error(result, "client_unavailable", symbol="AAPL")
+
+    @pytest.mark.asyncio
+    async def test_success(self):
+        import plugins.finworkbench_market_data.options_mcp_server as mod
+
+        fetch = AsyncMock(return_value={"results": [_CONTRACT]})
+        with _ensure(mod, True), patch.object(mod._marketbridge, "fetch_options_chain", new=fetch):
+            result = await mod.get_options_chain("AAPL", contract_type="call")
+
+        assert_ok_envelope(
+            result, symbol="AAPL", currency="USD",
+            timezone="America/New_York", count=1, source="marketbridge-data",
+        )
+        assert result["underlying_ticker"] == "AAPL"
+        assert result["data"][0]["ticker"] == _OPT
+
+    @pytest.mark.asyncio
+    async def test_upstream_error(self):
+        import plugins.finworkbench_market_data.options_mcp_server as mod
+
+        fetch = AsyncMock(return_value={"error": "Failed to fetch options chain: boom"})
+        with _ensure(mod, True), patch.object(mod._marketbridge, "fetch_options_chain", new=fetch):
+            result = await mod.get_options_chain("AAPL")
+
+        assert_error(result, "upstream_error")
+
+    @pytest.mark.asyncio
+    async def test_not_found_from_status_code(self):
+        import plugins.finworkbench_market_data.options_mcp_server as mod
+
+        fetch = AsyncMock(return_value={"error": "marketbridge-data error (404): unknown ticker"})
+        with _ensure(mod, True), patch.object(mod._marketbridge, "fetch_options_chain", new=fetch):
+            result = await mod.get_options_chain("AAPL")
+
+        assert_error(result, "not_found")
+
+    @pytest.mark.asyncio
+    async def test_an_underlying_outside_the_us_is_refused(self):
+        import plugins.finworkbench_market_data.options_mcp_server as mod
+
+        fetch = AsyncMock()
+        with _ensure(mod, True), patch.object(mod._marketbridge, "fetch_options_chain", new=fetch):
+            result = await mod.get_options_chain("0700.HK")
+
+        assert_error(result, "invalid_argument", symbol="0700.HK")
+        assert "currency" not in result
+        fetch.assert_not_awaited()
+
+
+# ---------------------------------------------------------------------------
+# get_options_prices
+# ---------------------------------------------------------------------------
+
+class TestGetOptionsPrices:
+    @pytest.mark.asyncio
+    async def test_unsupported_interval(self):
+        import plugins.finworkbench_market_data.options_mcp_server as mod
+
+        result = await mod.get_options_prices(_OPT, "2025-01-01", "2025-01-31", interval="3min")
+        assert_error(result, "unsupported_interval", symbol=_OPT)
+        assert "1day" in result["supported"]
+
+    @pytest.mark.asyncio
+    async def test_no_marketbridge_client(self):
+        import plugins.finworkbench_market_data.options_mcp_server as mod
+
+        with _ensure(mod, False):
+            result = await mod.get_options_prices(_OPT, "2025-01-01", "2025-01-31")
+
+        assert_error(result, "client_unavailable")
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "lo, hi, detail",
+        [
+            ("2025-01-31", "2025-01-01", "start is after end"),
+            ("01/01/2025", "2025-01-31", "from_date must be YYYY-MM-DD, not '01/01/2025'"),
+        ],
+    )
+    async def test_bounds_refused_as_the_price_tools_refuse_them(self, lo, hi, detail):
+        import plugins.finworkbench_market_data.options_mcp_server as mod
+
+        fetch = AsyncMock()
+        with _ensure(mod, True), patch.object(mod._marketbridge, "fetch_options_prices", new=fetch):
+            result = await mod.get_options_prices(_OPT, lo, hi)
+
+        assert_error(result, "invalid_argument", symbol=_OPT)
+        assert result["detail"] == detail
+        fetch.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_success_ascending_and_underlying_currency(self):
+        import plugins.finworkbench_market_data.options_mcp_server as mod
+
+        fetch = AsyncMock(return_value=FetchResult(list(_OPT_ROWS_DESC)))
+        with _ensure(mod, True), patch.object(mod._marketbridge, "fetch_options_prices", new=fetch):
+            result = await mod.get_options_prices(_OPT, "2025-01-01", "2025-01-31", interval="1day")
+
+        assert_ok_envelope(
+            result, symbol=_OPT, interval="1day", currency="USD",
+            timezone="America/New_York", count=2, source="marketbridge-data",
+        )
+        # currency is derived from the AAPL underlying.
+        # Descending client rows → ascending, oldest-first.
+        assert result["data"][0]["date"] == "2025-01-02"
+        assert result["data"][-1]["date"] == "2025-01-03"
+
+    @pytest.mark.asyncio
+    async def test_interval_alias_normalized(self):
+        import plugins.finworkbench_market_data.options_mcp_server as mod
+
+        fetch = AsyncMock(return_value=FetchResult(list(_OPT_ROWS_DESC)))
+        with _ensure(mod, True), patch.object(mod._marketbridge, "fetch_options_prices", new=fetch):
+            result = await mod.get_options_prices(_OPT, "2025-01-01", "2025-01-31", interval="1d")
+
+        assert_ok_envelope(result, interval="1day")
+        assert fetch.await_args.kwargs["interval"] == "1day"
+
+    @pytest.mark.asyncio
+    async def test_weekly_supported(self):
+        """Options prices serve the full canonical vocab (incl. 1week)."""
+        import plugins.finworkbench_market_data.options_mcp_server as mod
+
+        fetch = AsyncMock(return_value=FetchResult(list(_OPT_ROWS_DESC)))
+        with _ensure(mod, True), patch.object(mod._marketbridge, "fetch_options_prices", new=fetch):
+            result = await mod.get_options_prices(_OPT, "2025-01-01", "2025-03-31", interval="1week")
+
+        assert_ok_envelope(result, interval="1week")
+
+    @pytest.mark.asyncio
+    async def test_error_dict_maps_to_rate_limited(self):
+        import plugins.finworkbench_market_data.options_mcp_server as mod
+
+        fetch = AsyncMock(return_value={"error": "marketbridge-data error (429): slow down"})
+        with _ensure(mod, True), patch.object(mod._marketbridge, "fetch_options_prices", new=fetch):
+            result = await mod.get_options_prices(_OPT, "2025-01-01", "2025-01-31")
+
+        assert_error(result, "rate_limited")
+
+
+# ---------------------------------------------------------------------------
+# get_options_snapshot
+# ---------------------------------------------------------------------------
+
+class TestGetOptionsSnapshot:
+    @pytest.mark.asyncio
+    async def test_no_tickers(self):
+        import plugins.finworkbench_market_data.options_mcp_server as mod
+
+        result = await mod.get_options_snapshot("   ")
+        assert_error(result, "invalid_argument")
+
+    @pytest.mark.asyncio
+    async def test_no_marketbridge_client(self):
+        import plugins.finworkbench_market_data.options_mcp_server as mod
+
+        with _ensure(mod, False):
+            result = await mod.get_options_snapshot(_OPT)
+
+        assert_error(result, "client_unavailable")
+
+    @pytest.mark.asyncio
+    async def test_success_single_underlying(self):
+        import plugins.finworkbench_market_data.options_mcp_server as mod
+
+        canned = {"count": 1, "data": [_SNAP], "source": "marketbridge-data"}
+        fetch = AsyncMock(return_value=canned)
+        with _ensure(mod, True), patch.object(mod._marketbridge, "fetch_options_snapshot", new=fetch):
+            result = await mod.get_options_snapshot(_OPT)
+
+        assert_ok_envelope(
+            result, source="marketbridge-data", currency="USD",
+            timezone="America/New_York", count=1,
+        )
+        assert result["data"][0]["ticker"] == _OPT
+        assert "symbol" not in result  # batch payload has no single symbol
+
+    @pytest.mark.asyncio
+    async def test_rows_carry_local_times_and_a_stale_mark(self):
+        import plugins.finworkbench_market_data.options_mcp_server as mod
+
+        stale = {
+            "ticker": _OPT, "type": "options", "name": "AAPL $220.00 call", "market_status": "open",
+            # 2026-10-23 10:54:03 New York, weeks before the read.
+            "session": {"close": 222.0, "change_percent": 0.0, "volume": 1.0,
+                        "timeframe": "DELAYED", "last_updated": 1792767243597000000},
+            "greeks": {"delta": 0.98}, "implied_volatility": 2.8, "open_interest": 33,
+        }
+        canned = {"count": 1, "data": [stale], "source": "marketbridge-data"}
+        fetch = AsyncMock(return_value=canned)
+        with _ensure(mod, True), patch.object(mod._marketbridge, "fetch_options_snapshot", new=fetch):
+            result = await mod.get_options_snapshot(_OPT)
+
+        row = result["data"][0]
+        assert row["session"]["last_updated"] == "2026-10-23 10:54:03"
+        assert row["session"]["stale"] is True
+        assert row["implied_volatility"] == 2.8
+        assert "greeks" in row
+
+    @pytest.mark.asyncio
+    async def test_currency_omitted_when_underlying_unresolvable(self):
+        import plugins.finworkbench_market_data.options_mcp_server as mod
+
+        canned = {"count": 0, "data": [], "source": "marketbridge-data"}
+        fetch = AsyncMock(return_value=canned)
+        with _ensure(mod, True), patch.object(mod._marketbridge, "fetch_options_snapshot", new=fetch):
+            result = await mod.get_options_snapshot("JUNK1,JUNK2")
+
+        assert_ok_envelope(result, source="marketbridge-data")
+        assert "currency" not in result
+        assert "timezone" not in result
+
+    @pytest.mark.asyncio
+    async def test_upstream_error(self):
+        import plugins.finworkbench_market_data.options_mcp_server as mod
+
+        fetch = AsyncMock(return_value={"error": "Failed to fetch options snapshot: boom"})
+        with _ensure(mod, True), patch.object(mod._marketbridge, "fetch_options_snapshot", new=fetch):
+            result = await mod.get_options_snapshot(_OPT)
+
+        assert_error(result, "upstream_error")
+
+
+class TestTruncatedOptionsPrices:
+    @pytest.mark.asyncio
+    async def test_the_page_cap_reaches_the_envelope(self):
+        import plugins.finworkbench_market_data.options_mcp_server as mod
+
+        fetch = AsyncMock(return_value=FetchResult(list(_OPT_ROWS_DESC), True))
+        with _ensure(mod, True), patch.object(mod._marketbridge, "fetch_options_prices", new=fetch):
+            result = await mod.get_options_prices(_OPT, "2025-01-01", "2025-01-31")
+
+        assert_ok_envelope(result, count=2)
+        assert result["truncated"] is True
+
+
+class TestUnknownVenueCurrency:
+    @pytest.mark.asyncio
+    async def test_an_unknown_venue_gets_no_currency_and_a_us_class_share_keeps_usd(self):
+        import plugins.finworkbench_market_data.options_mcp_server as mod
+
+        fetch = AsyncMock(return_value={"results": [], "truncated": False})
+        with _ensure(mod, True), patch.object(mod._marketbridge, "fetch_options_chain", new=fetch):
+            unknown = await mod.get_options_chain("ZZZZ4.SA")
+            class_share = await mod.get_options_chain("BRK.B")
+
+        assert "currency" not in unknown
+        assert class_share["currency"] == "USD"
+
+
+class TestTruncatedOptionsChain:
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("more", [True, False])
+    async def test_more_contracts_than_limit_reaches_the_envelope(self, more):
+        import plugins.finworkbench_market_data.options_mcp_server as mod
+
+        fetch = AsyncMock(return_value={"results": [_CONTRACT], "truncated": more})
+        with _ensure(mod, True), patch.object(mod._marketbridge, "fetch_options_chain", new=fetch):
+            result = await mod.get_options_chain("AAPL", limit=1)
+
+        assert result.get("truncated", False) is more

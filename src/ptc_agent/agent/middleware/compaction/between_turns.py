@@ -1,0 +1,183 @@
+"""Compaction between turns, and what it measures, sent as the agent's own
+model call.
+
+A provider checks a compaction request against the conversation's own: the
+system prompt, tools and thinking it was sent with, which its cache and the
+thinking in the kept turns are verified against. Between turns no such
+request exists, so manual /compact and the hand-off at a model switch run the
+agent's model node outside a graph run, on the thread's state, and the
+``CompactionMiddleware`` in its chain does the work where it does it mid-turn
+(:func:`asked`) instead of calling the model for an answer. The context's
+size (``Measure``) and what the call sends ahead of its messages (``Parts``)
+are asked the same way, since only that chain builds the request a turn's
+call would send.
+
+Nothing is written here: the caller installs the answer, as manual /compact
+always has.
+"""
+
+from __future__ import annotations
+
+from collections.abc import Mapping
+from contextvars import ContextVar
+from dataclasses import dataclass
+from typing import TYPE_CHECKING, Any
+
+from langchain_core.messages import HumanMessage
+from langchain_core.runnables.config import ensure_config, var_child_runnable_config
+from langgraph._internal._constants import CONFIG_KEY_RUNTIME
+from langgraph.runtime import Runtime
+
+if TYPE_CHECKING:
+    from langgraph.graph.state import CompiledStateGraph
+
+    from ptc_agent.agent.middleware.compaction.compact import Compaction
+
+
+@dataclass(frozen=True)
+class Compact:
+    """Summarize all but the tail automatic compaction keeps."""
+
+
+@dataclass(frozen=True)
+class HandOff:
+    """Have the model whose provider wrote the view's opening summary, which
+    only that provider can read, write it out as text for a model of another
+    provider."""
+
+
+@dataclass(frozen=True)
+class WriteBrief:
+    """Have the view, through its last reply, written out as text for a
+    model that keeps a session of its own (Claude Code) and has seen none of
+    it. Nothing stays after it, and what follows the reply (the user's newest
+    messages) is left for that model to read as it is.
+
+    The agent's model writes it from its own request where ``by_own`` and it
+    reads the thread cheaply there, else the compaction model; when that
+    writes none, the reader is handed the history itself, fitted to
+    ``room`` tokens (``thread_summary``): half the 200k a Claude Code CLI
+    compacts at by default, when the reader's own threshold is not known.
+    """
+
+    by_own: bool = True
+    room: int = 100_000
+
+
+@dataclass(frozen=True)
+class Measure:
+    """The context the next turn start reads (``context_tokens``), of the
+    view the state makes now."""
+
+
+@dataclass(frozen=True)
+class Parts:
+    """What the next call sends ahead of its messages, in tokens by part
+    (``parts.ahead_parts``): the system prompt, the tools and the
+    baseline's sections."""
+
+
+@dataclass(frozen=True)
+class IdleCompact:
+    """Summarize a thread gone idle after a turn, while the provider still
+    caches its prompt: what the next turn start would force once the cache
+    expires, natively, or nothing (see ``rebuild.TurnStartRebuilds.idle``)."""
+
+
+Ask = Compact | HandOff | WriteBrief | Measure | Parts | IdleCompact
+
+
+class NoCompaction(RuntimeError):
+    """The agent's model chain holds no ``CompactionMiddleware`` to answer."""
+
+
+class IdleSkipped(RuntimeError):
+    """An ``IdleCompact`` the thread does not take now, for ``reason``."""
+
+    def __init__(self, reason: str) -> None:
+        super().__init__(reason)
+        self.reason = reason
+
+
+@dataclass
+class Asked:
+    """An ask on its way through the model node, and what answered it."""
+
+    ask: Ask
+    answer: Compaction | HumanMessage | dict[str, int] | int | None = None
+    answered: bool = False
+
+
+_asked: ContextVar[Asked | None] = ContextVar("compaction_asked", default=None)
+
+
+def asked() -> Asked | None:
+    """The ask the model call in progress carries, or None for a call of a
+    turn."""
+    return _asked.get()
+
+
+async def ask_between_turns(
+    agent: CompiledStateGraph,
+    state: Mapping[str, Any],
+    ask: Ask,
+    *,
+    thread_id: str,
+    store: Any | None = None,
+) -> Compaction | HumanMessage | dict[str, int] | int | None:
+    """``ask``, a compaction or a measure of the context, answered by the
+    ``CompactionMiddleware`` in ``agent``'s model chain, ``state`` being the
+    thread's checkpoint values.
+
+    A ``Compact`` answers with the compaction to install, a ``HandOff`` with
+    the summary message to put in place of the view's opening one, or None
+    when that summary is not one only its provider can read, a ``WriteBrief``
+    with the compaction whose summary message is the brief, a ``Measure``
+    with the context's size and a ``Parts`` with what is sent ahead of the
+    messages by part, neither calling a model. The calls made
+    for it report to the callbacks of the caller's runnable config, which bill
+    and trace them, as a turn's summarizer call reports to the turn's.
+
+    Raises:
+        ValueError: When the view leaves nothing to summarize, or the model
+            wrote no hand-off.
+        NoCompaction: When ``agent`` compacts nothing.
+    """
+    # The middleware's hook is a node of its own, named after it, so an agent
+    # built without it is told apart before its model is called as if for a
+    # turn. Imported here: the middleware imports this module.
+    from ptc_agent.agent.middleware.compaction.middleware import CompactionMiddleware
+
+    prefix = f"{CompactionMiddleware.__name__}."
+    if not any(name.startswith(prefix) for name in agent.builder.nodes):
+        raise NoCompaction("the agent has no compaction to ask")
+    node = agent.builder.nodes["model"].runnable
+    config = ensure_config(
+        {
+            "configurable": {
+                "thread_id": thread_id,
+                "checkpoint_ns": "",
+                # What a graph run would hand the node. Nothing streams the
+                # summarize signals between turns: the caller reports.
+                CONFIG_KEY_RUNTIME: Runtime(
+                    context=None, store=store, stream_writer=_unheard
+                ),
+            },
+        }
+    )
+    slot = Asked(ask)
+    asked_token = _asked.set(slot)
+    # The node reads its config the way a graph run's would find it.
+    config_token = var_child_runnable_config.set(config)
+    try:
+        await node.ainvoke(dict(state), config)
+    finally:
+        var_child_runnable_config.reset(config_token)
+        _asked.reset(asked_token)
+    if not slot.answered:
+        raise NoCompaction("the agent has no compaction to ask")
+    return slot.answer
+
+
+def _unheard(_chunk: Any) -> None:
+    pass

@@ -1,0 +1,149 @@
+/**
+ * context_window SSE event handling (compaction/offload notifications + token
+ * usage). Extracted verbatim from useChatMessages module scope (W1).
+ */
+
+import type { SSEEvent, ContextWindowCallbacks } from '../../session/types';
+import type { AssistantMessage, NotificationSegment } from '@/types/chat';
+import { applyCallUsage } from '../../session/tokenUsage';
+import { updateMessage } from './messageHelpers';
+
+/**
+ * Shared handler for context_window SSE events (token_usage, summarize, offload).
+ * Used by both history replay and live stream to avoid duplication.
+ *
+ * @param {Object} event - The context_window event
+ * @param {Object} callbacks
+ * @param {Function} callbacks.getMsgId - Returns current assistant message ID (or null)
+ * @param {Function} callbacks.nextOrder - Returns next content order counter value
+ * @param {Function} callbacks.setMessages - React state setter for messages
+ * @param {Function} callbacks.setTokenUsage - React state setter for token usage
+ * @param {boolean} callbacks.live - Whether the event comes off a live stream
+ * @param {Function|null} callbacks.setIsCompacting - React state setter (null for history)
+ * @param {Function} callbacks.insertNotification - Fallback: inserts standalone notification message
+ * @param {Function} callbacks.t - i18n translation function
+ * @param {React.MutableRefObject} callbacks.offloadBatch - Mutable ref for batching offload events
+ */
+function handleContextWindowEvent(event: SSEEvent, { getMsgId, nextOrder, setMessages, setTokenUsage, live, setIsCompacting, setCompactionTokens, insertNotification, t, offloadBatch }: ContextWindowCallbacks): void {
+  const action = event.action;
+
+  if (action === 'token_usage') {
+    setTokenUsage((prev) => applyCallUsage(prev, event, live));
+    return;
+  }
+
+  // A running count while the summary is written. Its own action rather than
+  // a summarize signal, which a build from before it reads as the end.
+  if (action === 'summary_progress') {
+    if (setIsCompacting && typeof event.summary_tokens === 'number') {
+      setCompactionTokens?.(event.summary_tokens);
+    }
+    return;
+  }
+
+  if (action === 'summarize') {
+    // SSE action value "summarize" preserved as wire protocol; the UI surfaces
+    // this as context compaction.
+    if (setIsCompacting && event.signal === 'start') {
+      setIsCompacting('summarize');
+      return;
+    }
+    if (setIsCompacting) setIsCompacting(false);
+    if (event.signal === 'complete') {
+      const text = t('chat.compactedNotification', { from: event.original_message_count });
+      const detail = (event.summary_text as string | undefined) || undefined;
+      const msgId = getMsgId();
+      if (msgId) {
+        appendNotification(setMessages, msgId, { content: text, order: nextOrder(), detail });
+      } else {
+        insertNotification(text, 'info', detail);
+      }
+    }
+    return;
+  }
+
+  // The turn opened on another model's brief. Its mark rides the turn's
+  // reply, which a turn always has by now: the brief comes ahead of any call.
+  if (action === 'brief') {
+    const msgId = getMsgId();
+    const to = event.to_model;
+    if (!msgId || typeof to !== 'string') return;
+    const from = typeof event.from_model === 'string' ? event.from_model : undefined;
+    const detail = (event.summary_text as string | undefined) || undefined;
+    appendNotification(setMessages, msgId, { handoff: { from, to }, order: nextOrder(), detail, detailKind: 'brief' });
+    return;
+  }
+
+  if (action === 'offload') {
+    if (event.signal === 'complete') {
+      const batch = offloadBatch;
+
+      // Accumulate counts
+      if (event.kind === 'reads') {
+        batch.current.reads += event.offloaded_reads || 0;
+      } else if (event.kind === 'args') {
+        batch.current.args += event.offloaded_args || 0;
+      } else {
+        // Manual /offload — combined event
+        batch.current.args += event.offloaded_args || 0;
+        batch.current.reads += event.offloaded_reads || 0;
+      }
+
+      // Capture msgId from first event in batch
+      if (batch.current.msgId === undefined) {
+        batch.current.msgId = getMsgId();
+      }
+
+      // Debounce: merge back-to-back offload events into a single notification
+      if (batch.current.timer) clearTimeout(batch.current.timer);
+      batch.current.flush = () => {
+        const { args, reads, msgId } = batch.current;
+        let text;
+        if (args > 0 && reads > 0) {
+          text = t('chat.offloadedNotification', { args, reads });
+        } else if (reads > 0) {
+          text = t('chat.offloadedReadsNotification', { count: reads });
+        } else if (args > 0) {
+          text = t('chat.offloadedArgsNotification', { count: args });
+        }
+
+        if (text) {
+          if (msgId) {
+            appendNotification(setMessages, msgId, { content: text, order: nextOrder() });
+          } else {
+            insertNotification(text);
+          }
+        }
+
+        // Reset batch
+        batch.current = { args: 0, reads: 0, timer: null, msgId: undefined };
+      };
+      batch.current.timer = setTimeout(batch.current.flush, 100);
+    }
+    return;
+  }
+}
+
+/** Add a notification segment to the end of assistant message `msgId`. */
+function appendNotification(
+  setMessages: ContextWindowCallbacks['setMessages'],
+  msgId: string,
+  segment: Omit<NotificationSegment, 'type'>,
+): void {
+  setMessages((prev) => updateMessage(prev, msgId, (msg) => {
+    if (msg.role !== 'assistant') return msg;
+    const aMsg = msg as AssistantMessage;
+    return { ...aMsg, contentSegments: [...(aMsg.contentSegments || []), { type: 'notification', ...segment }] };
+  }));
+}
+
+/** Write a debounced offload notice now, if one is waiting. */
+function flushOffloadBatch(batch: ContextWindowCallbacks['offloadBatch']): void {
+  const { timer, flush } = batch.current;
+  if (timer === null || !flush) return;
+  clearTimeout(timer);
+  flush();
+}
+
+
+export { handleContextWindowEvent, flushOffloadBatch };

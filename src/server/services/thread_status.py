@@ -1,0 +1,291 @@
+"""Thread runtime-status read model.
+
+Aggregates a thread's public status from the run ledger (one latest-attempt
+read — the in_progress slot always sorts newest), checkpoint metadata, and
+the report-back slice. Read-only: nothing here transitions run state.
+"""
+
+import asyncio
+import logging
+import time
+from typing import Optional
+
+from fastapi import HTTPException
+
+from src.server.utils.checkpoint_helpers import (
+    build_checkpoint_config,
+    get_checkpointer,
+    read_claude_session,
+    turn_base_checkpoint_id,
+)
+
+logger = logging.getLogger(__name__)
+
+
+# ============================================================================
+# Helper Functions for Checkpointer Access
+# ============================================================================
+
+
+async def get_checkpoint_tuple(thread_id: str, checkpoint_id: str = None):
+    """
+    Get checkpoint tuple from checkpointer.
+
+    Args:
+        thread_id: Thread identifier
+        checkpoint_id: Optional specific checkpoint ID
+
+    Returns:
+        CheckpointTuple or None if not found
+    """
+    checkpointer = get_checkpointer()
+    config = build_checkpoint_config(thread_id, checkpoint_id)
+    return await checkpointer.aget_tuple(config)
+
+
+def extract_state_values(checkpoint_tuple) -> dict:
+    """
+    Extract state values from checkpoint tuple.
+
+    The checkpoint contains serialized channel values that we can extract.
+    """
+    if not checkpoint_tuple or not checkpoint_tuple.checkpoint:
+        return {}
+
+    checkpoint = checkpoint_tuple.checkpoint
+    channel_values = checkpoint.get("channel_values", {})
+
+    # Return the channel values as state
+    return channel_values
+
+
+#: How long ``read_next_summary`` waits on the reads it makes itself, which a
+#: run's closing frame waits on; past it, the frame goes out without a hint.
+NEXT_SUMMARY_READ_TIMEOUT_S = 1.0
+
+#: What ``read_next_summary`` answers when its read failed or ran out of time,
+#: as against None, nothing to summarize: a run's closing frame then leaves
+#: the hint out, and the client reads the status for it.
+UNREAD = object()
+
+
+async def read_next_summary(
+    thread_id: str,
+    *,
+    latest: Optional[dict] = None,
+    values: Optional[dict] = None,
+) -> Optional[dict] | object:
+    """What the thread's next send summarizes first, for the composer:
+    ``{"reason": "threshold"}``, or ``{"reason": "cold" | "rebuild", "at": <epoch ms>, "now": <epoch ms>}``
+    once the cache expires at ``at``, or None (see ``rebuild.next_summary``).
+    ``now`` is this server's clock at the read, so a client waits ``at - now``
+    from when the reading arrives rather than reading ``at`` on its own clock.
+    Read from the main agent's checkpointed ``values`` and the settle time of
+    ``latest``, the thread's latest run attempt, each read when not passed,
+    or of the latest that made a call (``cache_clock_attempt``), the inputs
+    its turn start reads. Unpassed, the values are the checkpoint the next
+    turn starts from (``turn_base_checkpoint_id``), which is not the newest
+    after a fork stopped before its first step, read after ``latest``: a run
+    commits its last checkpoint before its terminal row, so a ledger that
+    shows it over is never read with the state from before its answer. A
+    Claude Code thread whose last answer was Claude Code's reads its
+    session's records there and the rules that turn ran under instead
+    (``claude_code.compaction.next_summary``). A failed or slow read answers
+    ``UNREAD`` rather than fail or hold up its caller."""
+    from src.server.contracts.run_times import run_settled_at
+    from src.server.database.runs import lifecycle as tl_db
+    from src.server.services.runs.pending_input import cache_clock_attempt
+    from ptc_agent.agent.claude_code.session import claude_code_rules
+    from ptc_agent.agent.middleware.compaction.rebuild import next_summary
+
+    try:
+        async with asyncio.timeout(NEXT_SUMMARY_READ_TIMEOUT_S):
+            if latest is None:
+                latest = await tl_db.get_latest_attempt(thread_id)
+            base = None
+            if values is None:
+                base = await turn_base_checkpoint_id(get_checkpointer(), thread_id)
+                values = extract_state_values(await get_checkpoint_tuple(thread_id, base))
+            rules = claude_code_rules(values)
+            records = await read_claude_session(thread_id, base) if rules else None
+            clock = await cache_clock_attempt(thread_id, latest)
+        settled_at = run_settled_at(clock)
+        if rules:
+            # Only a Claude Code thread loads the SDK, which a backend without
+            # the claude-code extra lacks (see the package docstring).
+            from ptc_agent.agent.claude_code import compaction as claude_code
+
+            found = claude_code.next_summary(rules, records, settled_at=settled_at)
+        else:
+            found = next_summary(values, settled_at=settled_at)
+    except Exception:
+        logger.debug("next summary read failed for thread %s", thread_id, exc_info=True)
+        return UNREAD
+    if found is None:
+        return None
+    at = found.get("at")
+    if at is None:
+        return {"reason": found["reason"]}
+    return {"reason": found["reason"], "at": round(at * 1000), "now": round(time.time() * 1000)}
+
+
+async def read_thread_runtime_status(
+    thread_id: str,
+    is_shared: Optional[bool] = None,
+    user_id: Optional[str] = None,
+) -> dict:
+    """
+    Get current workflow execution status.
+
+    Args:
+        thread_id: Thread ID to check status for
+        is_shared: Pre-resolved share flag. When provided (e.g. the ``/status``
+            route already read it while authorizing), skips a redundant thread
+            lookup; when ``None``, this fetches it.
+        user_id: Pre-resolved thread owner, which scopes the labels of the
+            threads a report-back is owed by. Looked up with the report-back
+            read when ``None``.
+
+    Returns:
+        Dict with current status, reconnectability, and progress info
+    """
+    try:
+        # Checkpoint read feeds only the payload's `progress` garnish — never
+        # status truth (a checkpoint with no pending sends says nothing about
+        # whether a run is live).
+        checkpoint_info = None
+        try:
+            checkpoint_tuple = await get_checkpoint_tuple(thread_id)
+            if checkpoint_tuple:
+                state_values = extract_state_values(checkpoint_tuple)
+                checkpoint_data = checkpoint_tuple.checkpoint or {}
+                pending_sends = checkpoint_data.get("pending_sends", [])
+
+                checkpoint_info = {
+                    "has_plan": False,  # PTC doesn't use plans
+                    "has_final_report": bool(state_values.get("final_report")),
+                    "completed": len(pending_sends) == 0,
+                    "checkpoint_id": checkpoint_tuple.config.get(
+                        "configurable", {}
+                    ).get("checkpoint_id"),
+                }
+        except Exception as e:
+            logger.debug(f"Could not fetch checkpoint info for {thread_id}: {e}")
+
+        # The ledger decides (v4 2.4): ONE read of the latest attempt. The
+        # in_progress slot ALWAYS sorts latest (run_seq DESC — a live run is
+        # the newest insert on the thread), so a
+        # single row answers live and settled alike; a get_active_run +
+        # get_latest_attempt pair reads two snapshots and a START committing
+        # between them yields status="running" with run_id=None and reconnect
+        # disabled (review F7). Live rows speak the live vocabulary
+        # (stopping = durable cancel intent), terminal rows their terminal
+        # status, no row = idle. Same answer on every worker — the tracker
+        # blob, the checkpoint status fallback, and the stale-ACTIVE heal are
+        # gone from this path (the recovery scanner owns orphan convergence).
+        from src.server.database.runs import lifecycle as tl_db
+        from src.server.contracts.status import to_public
+
+        run_id = None
+        can_reconnect = False
+        row_ts = None
+        latest = await tl_db.get_latest_attempt(thread_id)
+        if latest is not None and latest["status"] == "in_progress":
+            run_id = str(latest["conversation_response_id"])
+            status = to_public(
+                latest["status"],
+                cancel_requested_at=latest.get("cancel_requested_at"),
+            )
+            # Reconnect attaches to the shared Redis stream, so it is
+            # worker-agnostic: no local-executor requirement. A crashed
+            # owner's stream still terminates — the scanner's finalize
+            # appends the visible run_end.
+            can_reconnect = status in ("running", "stopping")
+            row_ts = latest.get("created_at")
+        else:
+            status = to_public(latest["status"]) if latest is not None else "idle"
+            row_ts = latest.get("created_at") if latest is not None else None
+        last_update = row_ts.isoformat() if row_ts is not None else None
+
+        # Include share status so the UI can show the correct icon without an
+        # extra API call. The ``/status`` route resolves this while authorizing
+        # and passes it in; only fetch when a caller didn't.
+        if is_shared is None:
+            try:
+                from src.server.database.conversation import get_thread_by_id
+
+                thread_row = await get_thread_by_id(thread_id)
+                is_shared = bool(thread_row.get("is_shared")) if thread_row else False
+            except Exception as e:
+                logger.debug(f"Could not fetch share status for {thread_id}: {e}")
+                is_shared = False
+
+        # Report-back pendingness AND the subagent ids for per-task reattach,
+        # from both read models (task slice = outbox row + ledger-backed
+        # active tasks; analyst hand-offs = Redis watch set).
+        # active_tasks is NOT gated on an in_progress run: tail-mode
+        # subagents outlive the run's terminal row.
+        from src.server.services.report_back.handoff.status import read_report_back_slice
+
+        rb = await read_report_back_slice(thread_id, user_id)
+        active_tasks = rb.get("active_tasks", [])
+        active_commands = rb.get("active_commands", [])
+        pending_report_back = rb["pending_report_back"]
+        report_back_run_id = rb["report_back_run_id"]
+        recent_report_back_run_ids = rb.get("recent_report_back_run_ids", [])
+        owed_threads = rb.get("owed_threads")
+        owed_report_kinds = rb.get("owed_report_kinds")
+
+        # Staleness signal for cached (never-unmounted) frontend views: once a
+        # run is terminal there is no reconnectable run_id, so the persisted
+        # turn counter is the only way such a view can tell it missed a turn.
+        # Present for terminal AND live threads; None when the thread has no
+        # persisted turns (or the read failed).
+        from src.server.database.conversation import get_latest_turn_index
+
+        latest_turn_index = await get_latest_turn_index(thread_id)
+
+        # What the thread has used, for the chat's token totals. Read here, not
+        # with the replay, because this status decides whether the client
+        # reconnects: the run it names live is left out, and the reconnect
+        # replays that run's calls from the start.
+        from src.server.database.conversation.usage import get_thread_token_totals
+
+        token_totals = await get_thread_token_totals(thread_id, live_run_id=run_id)
+
+        # An interrupted run resumes where it stopped, past its turn start.
+        next_summary = (
+            None
+            if run_id or status == "interrupted"
+            else await read_next_summary(thread_id, latest=latest)
+        )
+        if next_summary is UNREAD:
+            next_summary = None
+
+        response = {
+            "thread_id": thread_id,
+            "run_id": run_id,
+            "status": status,
+            "can_reconnect": can_reconnect,
+            "latest_turn_index": latest_turn_index,
+            "token_totals": token_totals,
+            "next_summary": next_summary,
+            "last_update": last_update,
+            "progress": checkpoint_info,
+            "active_tasks": active_tasks,
+            "active_commands": active_commands,
+            "is_shared": is_shared,
+            "pending_report_back": pending_report_back,
+            "report_back_run_id": report_back_run_id,
+            "recent_report_back_run_ids": recent_report_back_run_ids,
+            "owed_threads": owed_threads,
+            "owed_report_kinds": owed_report_kinds,
+        }
+
+        logger.debug(f"Status check for {thread_id}: {status}")
+
+        return response
+
+    except Exception as e:
+        logger.exception(f"Error checking workflow status for {thread_id}: {e}")
+        raise HTTPException(status_code=500, detail="Failed to check turn status")

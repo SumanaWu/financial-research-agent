@@ -1,0 +1,287 @@
+import { describe, it, expect, vi } from 'vitest';
+import { render, screen, fireEvent } from '@testing-library/react';
+import { MemoryRouter, Routes, Route, useLocation } from 'react-router';
+import { ErrorBanner } from '../error-banner';
+import type { StructuredError } from '@/utils/rateLimitError';
+
+// The model's display name comes from the cached catalog, which the app's
+// query client holds; here the key stands for it.
+vi.mock('@/hooks/useModelName', () => ({ useModelName: () => (id: string) => id }));
+// A plan's reset is told in the reader's zone; here a fixed one.
+vi.mock('@/hooks/useClaudeCodePlan', () => ({
+  usePlanClock: () => ({ locale: 'en-US', zone: 'America/New_York', now: Date.parse('2026-11-06T19:05:00Z') }),
+}));
+
+const desktop = vi.hoisted(() => ({ shell: false }));
+vi.mock('@/lib/desktop', async (original) => ({
+  ...(await original<typeof import('@/lib/desktop')>()),
+  isDesktopShell: () => desktop.shell,
+}));
+// The control for a computer too small for Claude Code decides what it reads
+// from the computer's row and plan; here it only names the computer.
+vi.mock('@/pages/ChatAgent/components/MediumActionLink', () => ({
+  MediumActionLink: ({ computerId }: { computerId: string }) => <span>{`medium:${computerId}`}</span>,
+}));
+
+function LocationProbe({ onPath }: { onPath: (path: string) => void }) {
+  const loc = useLocation();
+  onPath(loc.pathname);
+  return null;
+}
+
+function renderInRouter(ui: React.ReactNode, onPath?: (p: string) => void) {
+  return render(
+    <MemoryRouter initialEntries={['/start']}>
+      <Routes>
+        <Route path="*" element={
+          <>
+            {ui}
+            {onPath && <LocationProbe onPath={onPath} />}
+          </>
+        } />
+      </Routes>
+    </MemoryRouter>
+  );
+}
+
+describe('ErrorBanner', () => {
+  it('returns nothing when error is null', () => {
+    const { container } = renderInRouter(<ErrorBanner error={null} />);
+    expect(container).toBeEmptyDOMElement();
+  });
+
+  it('returns nothing when error is undefined', () => {
+    const { container } = renderInRouter(<ErrorBanner error={undefined} />);
+    expect(container).toBeEmptyDOMElement();
+  });
+
+  it('renders a plain string error', () => {
+    renderInRouter(<ErrorBanner error="Something went wrong" />);
+    expect(screen.getByText(/Something went wrong/)).toBeInTheDocument();
+  });
+
+  it('renders a StructuredError message', () => {
+    const err: StructuredError = {
+      message: 'Daily credit limit reached',
+    };
+    renderInRouter(<ErrorBanner error={err} />);
+    expect(screen.getByText('Daily credit limit reached')).toBeInTheDocument();
+  });
+
+  it('renders an internal link that navigates via react-router', () => {
+    const err: StructuredError = {
+      message: 'You hit the credit limit.',
+      links: [{ url: '/settings/billing', label: 'View Usage' }],
+    };
+    let currentPath = '';
+    renderInRouter(<ErrorBanner error={err} />, (p) => { currentPath = p; });
+    const link = screen.getByText('View Usage');
+    expect(link).toBeInTheDocument();
+    expect(link.tagName).toBe('A');
+    expect(link).not.toHaveAttribute('target');
+    fireEvent.click(link);
+    expect(currentPath).toBe('/settings/billing');
+  });
+
+  it('leaves a same-origin external link to the browser, in a new tab', () => {
+    // /account/plans is served by the account portal, a different app on the
+    // same origin. Routing to it would land on our catch-all and load nothing,
+    // and navigating in place would discard the banner and the rejected
+    // message, which only ever existed in client state.
+    const err: StructuredError = {
+      message: 'Monthly credit limit reached.',
+      links: [{ url: '/account/plans', label: 'Upgrade plan', external: true }],
+    };
+    let currentPath = '';
+    renderInRouter(<ErrorBanner error={err} />, (p) => { currentPath = p; });
+    const link = screen.getByText('Upgrade plan');
+    expect(link).toHaveAttribute('href', '/account/plans');
+    expect(link).toHaveAttribute('target', '_blank');
+    expect(link).toHaveAttribute('rel', 'noopener noreferrer');
+    fireEvent.click(link);
+    expect(currentPath).toBe('/start');
+  });
+
+  it('renders every link in order, separated', () => {
+    const err: StructuredError = {
+      message: 'Monthly credit limit reached.',
+      links: [
+        { url: '/account/plans', label: 'Upgrade plan', external: true },
+        { url: '/account/usage', label: 'View usage', external: true },
+      ],
+    };
+    renderInRouter(<ErrorBanner error={err} />);
+    const links = screen.getAllByRole('link');
+    expect(links.map((l) => l.textContent)).toEqual(['Upgrade plan', 'View usage']);
+    expect(links[1]).toHaveAttribute('href', '/account/usage');
+    expect(links[1]).toHaveAttribute('target', '_blank');
+    // The separator is decoration, so it must not reach the accessible name.
+    expect(screen.getByText('·')).toHaveAttribute('aria-hidden', 'true');
+  });
+
+  it('renders an external link with target=_blank', () => {
+    const err: StructuredError = {
+      message: 'Upstream provider failed.',
+      links: [{ url: 'https://status.anthropic.com', label: 'Status' }],
+    };
+    renderInRouter(<ErrorBanner error={err} />);
+    const link = screen.getByText('Status');
+    expect(link).toHaveAttribute('target', '_blank');
+    expect(link).toHaveAttribute('rel', 'noopener noreferrer');
+  });
+
+  it('draws a link that resizes a computer as the control for it, not an anchor to the link\'s own url', () => {
+    const err: StructuredError = {
+      message: 'Claude Code needs a Medium cloud computer.',
+      links: [{ url: '?resize=c-1', label: 'Change spec', resize: 'c-1' }],
+    };
+    renderInRouter(<ErrorBanner error={err} />);
+    expect(screen.getByText('medium:c-1')).toBeInTheDocument();
+    expect(screen.queryByRole('link')).toBeNull();
+    expect(screen.queryByText('Change spec')).toBeNull();
+  });
+
+  it('opens an account console page in a new tab in a browser', () => {
+    desktop.shell = false;
+    const err: StructuredError = {
+      message: 'Monthly credit limit reached.',
+      links: [{ url: '/account/plans', label: 'Upgrade plan', console: true }],
+    };
+    let currentPath = '';
+    renderInRouter(<ErrorBanner error={err} />, (p) => { currentPath = p; });
+    const link = screen.getByRole('link', { name: 'Upgrade plan' });
+    expect(link).toHaveAttribute('href', '/account/plans');
+    expect(link).toHaveAttribute('target', '_blank');
+    expect(link).toHaveAttribute('rel', 'noopener noreferrer');
+    fireEvent.click(link);
+    expect(currentPath).toBe('/start');
+  });
+
+  it('opens an account console page in this window in the desktop app, which would send a new tab to a signed-out browser', () => {
+    desktop.shell = true;
+    const err: StructuredError = {
+      message: 'Monthly credit limit reached.',
+      links: [{ url: '/account/plans', label: 'Upgrade plan', console: true }],
+    };
+    let currentPath = '';
+    renderInRouter(<ErrorBanner error={err} />, (p) => { currentPath = p; });
+    const link = screen.getByRole('link', { name: 'Upgrade plan' });
+    expect(link).toHaveAttribute('href', '/account/plans');
+    expect(link).not.toHaveAttribute('target');
+    const stayPut = (e: Event) => e.preventDefault();
+    document.addEventListener('click', stayPut);
+    fireEvent.click(link);
+    document.removeEventListener('click', stayPut);
+    expect(currentPath).toBe('/start');
+    desktop.shell = false;
+  });
+
+  it('renders upstream hints as a bulleted list', () => {
+    const err: StructuredError = {
+      message: 'Upstream provider error',
+      kind: 'upstream',
+      statusCode: 503,
+      hints: ['api_key', 'provider_status'],
+    };
+    renderInRouter(<ErrorBanner error={err} />);
+    // Two list items rendered for two hints
+    const items = screen.getAllByRole('listitem');
+    expect(items).toHaveLength(2);
+  });
+
+  it('renders an internal-error headline when kind is internal', () => {
+    const consoleErr = vi.spyOn(console, 'error').mockImplementation(() => {});
+    const err: StructuredError = {
+      message: 'Database unavailable',
+      kind: 'internal',
+    };
+    renderInRouter(<ErrorBanner error={err} />);
+    expect(screen.getByText('Database unavailable')).toBeInTheDocument();
+    consoleErr.mockRestore();
+  });
+
+  it('shows an internal failure the server sent no words for as its headline alone', () => {
+    // A run that failed where no error frame could be written for it.
+    const { container } = renderInRouter(<ErrorBanner error={{ message: '', kind: 'internal' }} />);
+    const column = container.querySelector('.flex-col');
+    expect(column?.children).toHaveLength(1);
+    expect(column?.textContent).not.toBe('');
+  });
+
+  // Ported from ChatViewErrorBanner.test.tsx (local-copy drift test, deleted):
+  // scenarios the ChatView banner relies on that were not covered above.
+
+  it('renders a structured error without a link (no link role present)', () => {
+    const err: StructuredError = {
+      message: 'Too many concurrent requests. Please wait a moment.',
+    };
+    renderInRouter(<ErrorBanner error={err} />);
+    expect(screen.getByText(/Too many concurrent requests/)).toBeInTheDocument();
+    expect(screen.queryByRole('link')).not.toBeInTheDocument();
+  });
+
+  it('renders the upstream headline with the status code interpolated', () => {
+    const err: StructuredError = {
+      message: "Error code: 500 - {'error': {'message': 'Internal service error'}}",
+      kind: 'upstream',
+      statusCode: 500,
+      hints: ['api_key'],
+    };
+    renderInRouter(<ErrorBanner error={err} />);
+    expect(screen.getByText('The model provider returned an error (500)')).toBeInTheDocument();
+  });
+
+  it('renders the upstream headline without a status suffix when backend omits it', () => {
+    const err: StructuredError = {
+      message: 'Connection reset by peer',
+      kind: 'upstream',
+      hints: ['provider_status'],
+    };
+    renderInRouter(<ErrorBanner error={err} />);
+    const headline = screen.getByText('The model provider returned an error');
+    expect(headline.textContent).not.toMatch(/\(/);
+  });
+
+  it('passes a descriptive rate-limit string through without a redundant prefix', () => {
+    renderInRouter(<ErrorBanner error="Daily credit limit reached (50/50 credits). Resets at midnight UTC." />);
+    expect(screen.getByText(/Daily credit limit reached/)).toBeInTheDocument();
+    expect(screen.queryByText(/Rate limit exceeded:/)).not.toBeInTheDocument();
+  });
+
+  it('renders a notice as information, not as an error', () => {
+    const err: StructuredError = { message: 'This chat changed somewhere else, so it was refreshed. Try again.', kind: 'notice' };
+    const { container } = renderInRouter(<ErrorBanner error={err} />);
+    const row = screen.getByRole('status');
+    expect(row).toHaveTextContent(err.message);
+    expect(row.getAttribute('style')).toContain('var(--color-text-tertiary)');
+    expect(container.innerHTML).not.toContain('--color-loss');
+  });
+
+  it("shows a subscription's limit as the plan card, without the provider's words or hints", () => {
+    const err: StructuredError = {
+      message: "Error code: 429 - {'error': {'type': 'usage_limit_reached'}}",
+      kind: 'upstream',
+      statusCode: 429,
+      payer: 'subscription',
+      account: 'ChatGPT',
+      reason: 'plan_limit',
+      hints: ['try_another_model'],
+      planLimit: { plan: 'ChatGPT Plus', window: 'seven_day', until: '2026-11-06T20:40:00Z' },
+    };
+    renderInRouter(<ErrorBanner error={err} />);
+    expect(screen.getByText('ChatGPT Plus plan limit reached')).toBeInTheDocument();
+    expect(screen.getByText(
+      "Your ChatGPT Plus plan's weekly limit is used up. It resets at 3:40 PM. Pick another model, or send this again after it resets.",
+    )).toBeInTheDocument();
+    expect(screen.queryByText(/usage_limit_reached/)).not.toBeInTheDocument();
+    expect(screen.queryByText(/The model provider returned an error/)).not.toBeInTheDocument();
+    expect(screen.queryByText(/connected subscription/)).not.toBeInTheDocument();
+    expect(screen.queryByRole('listitem')).not.toBeInTheDocument();
+  });
+
+  it('keeps the error style for a failure', () => {
+    const { container } = renderInRouter(<ErrorBanner error="Failed to send message" />);
+    expect(screen.queryByRole('status')).not.toBeInTheDocument();
+    expect(container.innerHTML).toContain('--color-loss');
+  });
+});

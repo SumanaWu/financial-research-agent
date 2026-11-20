@@ -1,0 +1,302 @@
+# Modified on 2026-11-17 for local study distribution; display names and nonessential project links adjusted. See MODIFICATIONS.md.
+"""marketbridge-data implementation of MarketDataSource."""
+
+from __future__ import annotations
+
+import logging
+from datetime import date, datetime, timedelta
+from typing import Any
+
+from src.data_client.base import FetchResult, IntervalNotSupported
+from src.data_client.instrument_clock import clock_for
+from src.data_client.normalize import build_series, change_from
+from market_protocol import InstrumentRef, Series
+from market_protocol import display_spelling, index_families, to_legacy_api
+
+from .client import MarketBridgeDataClient
+
+logger = logging.getLogger(__name__)
+
+
+def vendor_epoch_ms(value: Any) -> int | None:
+    """Unix ms from a vendor epoch in s / ms / µs / ns (Massive stamps trades in ns)."""
+    if not isinstance(value, (int, float)) or value <= 0:
+        return None
+    if value >= 1e17:
+        return int(value // 1_000_000)
+    if value >= 1e14:
+        return int(value // 1_000)
+    if value >= 1e11:
+        return int(value)
+    return int(value * 1000)
+
+
+def _index_quote(ticker: str, session: dict[str, Any], as_of: int | None) -> tuple[Any, Any, int | None]:
+    """The move of the index level shown, and when that level printed.
+
+    The feed's own move is rounded and can trail the level by minutes in
+    session. The feed can also stop refreshing an index's stamp and move once a
+    new session opens: the move then reads exactly 0, stamped before the newest
+    session that has opened (before it opens, the zero may be the stamped
+    session's own). A level that moved on since is not dated by the old stamp;
+    one that has not is a previous close with no move of the new session yet.
+    """
+    close, previous = session.get("close"), session.get("previous_close")
+    if as_of is not None and close is not None and session.get("change") == 0:
+        clock = clock_for(ticker, True)
+        stamped = datetime.fromtimestamp(as_of / 1000, clock.tz).date().isoformat()
+        if clock.expected_latest_daily_date() > stamped:
+            if close == previous:
+                return None, None, as_of
+            as_of = None
+    if close is not None and previous:
+        return (*change_from(close, previous), as_of)
+    return session.get("change"), session.get("change_percent"), as_of
+
+
+def normalize_series(rows: list[dict], *, ref: InstrumentRef, schema: str) -> Series:
+    """Normalize marketbridge-data bars (epoch-ms ``time`` already UTC) to a Series."""
+    return build_series(
+        rows, ref=ref, schema=schema, publisher="marketbridge-data",
+        ts_of=lambda row: int(row["time"]) if row.get("time") else 0,
+    )
+
+# FMP-style interval → marketbridge-data (timespan, multiplier). Second bars are
+# WS-only (forming-bar stream) — deliberately absent here.
+INTERVAL_MAP: dict[str, tuple[str, int]] = {
+    "1min": ("minute", 1),
+    "5min": ("minute", 5),
+    "15min": ("minute", 15),
+    "30min": ("minute", 30),
+    "1hour": ("hour", 1),
+    "4hour": ("hour", 4),
+}
+
+# Legacy bare index symbol → marketbridge-data's wire spelling, which is Polygon's:
+# the family behind an ``I:`` prefix (``GSPC`` → ``I:SPX``). Reverse for
+# snapshot response → bare lookup.
+INDEX_TICKERS: dict[str, str] = {
+    to_legacy_api(ref): f"I:{ref.index_family}" for ref in index_families()
+}
+_REVERSE_INDEX_TICKERS: dict[str, str] = {v: k for k, v in INDEX_TICKERS.items()}
+
+
+def index_ticker(symbol: str) -> str:
+    """marketbridge-data spelling of a Yahoo/FMP-style or bare index symbol.
+
+    An index the protocol has no family for keeps its own name (``I:{bare}``).
+    """
+    if symbol.startswith("I:"):
+        return symbol
+    bare = symbol.lstrip("^").upper()
+    return INDEX_TICKERS.get(bare, f"I:{bare}")
+
+
+class MarketBridgeDataSource:
+    """Market data source backed by marketbridge-data REST API."""
+
+    # Per-page limit for the upstream API (max 50000). The client auto-
+    # paginates, so the actual result set may exceed this.
+    _DEFAULT_LIMIT = 5000
+
+    # Interval-aware lookback windows (trading days).
+    # Each live cache key stores bars from this window; incoming requests
+    # with a from/to that falls within the window are served from cache.
+    _LOOKBACK_BY_INTERVAL: dict[str, int] = {
+        "1min": 5,     # ~1,950 bars, ~230 KB
+        "5min": 10,    # ~780 bars, ~95 KB
+        "15min": 10,   # ~260 bars, ~32 KB
+        "30min": 10,   # ~130 bars, ~16 KB
+        "1hour": 10,   # ~65 bars, ~8 KB
+        "4hour": 10,   # ~17 bars, ~2 KB
+    }
+    _DAILY_LOOKBACK_DAYS = 365 * 2  # ~504 bars, ~55 KB
+
+    def __init__(self, client: MarketBridgeDataClient) -> None:
+        self.client = client
+
+    @classmethod
+    def lookback_days_for(cls, interval: str) -> int:
+        """Return the default lookback window in calendar days for *interval*."""
+        return cls._LOOKBACK_BY_INTERVAL.get(interval, 7)
+
+    @staticmethod
+    def _default_dates(
+        from_date: str | None, to_date: str | None, lookback_days: int
+    ) -> tuple[str, str]:
+        """marketbridge-data requires from/to — supply sensible defaults."""
+        if to_date is None:
+            to_date = date.today().strftime("%Y-%m-%d")
+        if from_date is None:
+            from_date = (date.today() - timedelta(days=lookback_days)).strftime("%Y-%m-%d")
+        return from_date, to_date
+
+    async def get_intraday(
+        self,
+        symbol: str,
+        interval: str,
+        from_date: str | None = None,
+        to_date: str | None = None,
+        is_index: bool = False,
+        user_id: str | None = None,
+    ) -> FetchResult:
+        market = "index" if is_index else "stock"
+        api_symbol = index_ticker(symbol) if is_index else symbol
+        if interval not in INTERVAL_MAP:
+            raise IntervalNotSupported(f"Unsupported interval: {interval}")
+        timespan, multiplier = INTERVAL_MAP[interval]
+        lookback = self._LOOKBACK_BY_INTERVAL.get(interval, 7)
+        from_date, to_date = self._default_dates(from_date, to_date, lookback)
+        limit = self._DEFAULT_LIMIT
+        logger.info(
+            "get_intraday %s %s from=%s to=%s limit=%d",
+            api_symbol, interval, from_date, to_date, limit,
+        )
+        raw, truncated = await self.client.get_aggregates(
+            market=market,
+            symbol=api_symbol,
+            timespan=timespan,
+            multiplier=multiplier,
+            from_date=from_date,
+            to_date=to_date,
+            limit=limit,
+            user_id=user_id,
+        )
+        bars = [self._normalize(r) for r in raw]
+        bars.sort(key=lambda b: b.get("time", 0))  # ensure ascending for cache watermark/merge
+        first_t = bars[0].get("time") if bars else None
+        last_t = bars[-1].get("time") if bars else None
+        logger.info(
+            "get_intraday %s %s → %d bars, first=%s last=%s",
+            api_symbol, interval, len(bars), first_t, last_t,
+        )
+        return FetchResult(bars=bars, truncated=truncated)
+
+    async def get_daily(
+        self,
+        symbol: str,
+        from_date: str | None = None,
+        to_date: str | None = None,
+        is_index: bool = False,
+        user_id: str | None = None,
+    ) -> FetchResult:
+        market = "index" if is_index else "stock"
+        api_symbol = index_ticker(symbol) if is_index else symbol
+        from_date, to_date = self._default_dates(
+            from_date, to_date, self._DAILY_LOOKBACK_DAYS
+        )
+        limit = self._DEFAULT_LIMIT
+        raw, truncated = await self.client.get_aggregates(
+            market=market,
+            symbol=api_symbol,
+            timespan="day",
+            multiplier=1,
+            from_date=from_date,
+            to_date=to_date,
+            limit=limit,
+            user_id=user_id,
+        )
+        return FetchResult(bars=[self._normalize(r) for r in raw], truncated=truncated)
+
+    @staticmethod
+    def _normalize(row: dict[str, Any]) -> dict[str, Any]:
+        """Normalize a marketbridge-data bar to the standard OHLCV shape."""
+        return {
+            "time": row.get("time", 0),
+            "open": row.get("open", 0.0),
+            "high": row.get("high", 0.0),
+            "low": row.get("low", 0.0),
+            "close": row.get("close", 0.0),
+            "volume": int(row.get("volume", 0)),
+        }
+
+    async def get_snapshots(
+        self,
+        symbols: list[str],
+        asset_type: str = "stocks",
+        user_id: str | None = None,
+    ) -> list[dict[str, Any]]:
+        """Fetch batch snapshots, converting index symbols as needed."""
+        if asset_type == "indices":
+            api_symbols = [index_ticker(s) for s in symbols]
+        else:
+            api_symbols = symbols
+        raw = await self.client.get_snapshots(asset_type, api_symbols, user_id=user_id)
+        return [self._normalize_snapshot(item, asset_type) for item in raw]
+
+    async def get_market_status(
+        self,
+        user_id: str | None = None,
+    ) -> dict[str, Any]:
+        """Fetch current market status from marketbridge-data."""
+        return await self.client.get_market_status(user_id=user_id)
+
+    @staticmethod
+    def _normalize_snapshot(raw: dict[str, Any], asset_type: str = "stocks") -> dict[str, Any]:
+        """Normalize a marketbridge-data snapshot to the unified snapshot shape."""
+        session = raw.get("session", {})
+        last_trade = raw.get("last_trade", {})
+        last_minute = raw.get("last_minute", {})
+        ticker = raw.get("ticker", "")
+        change, change_percent = session.get("change"), session.get("change_percent")
+        # The feed's newest stamp, not the last trade's alone: a thin name on a
+        # realtime feed can go minutes without a print while its quote keeps
+        # moving, and that is not a delay. An index has only its own stamp.
+        as_of = max(
+            (
+                ms for ms in (
+                    vendor_epoch_ms((last_trade or {}).get("last_updated")),
+                    vendor_epoch_ms((raw.get("last_quote") or {}).get("last_updated")),
+                    vendor_epoch_ms(raw.get("last_updated")),
+                ) if ms
+            ),
+            default=None,
+        )
+        if asset_type == "indices":
+            ticker = _REVERSE_INDEX_TICKERS.get(ticker, ticker.removeprefix("I:"))
+            change, change_percent, as_of = _index_quote(ticker, session, as_of)
+        else:
+            # A stock comes back in Massive's spelling (BRK.B) and leaves in ours (BRK-B).
+            ticker = display_spelling(ticker)
+        return {
+            "symbol": ticker,
+            "name": raw.get("name"),
+            "price": session.get("close"),
+            "change": change,
+            "change_percent": change_percent,
+            "previous_close": session.get("previous_close"),
+            "open": session.get("open"),
+            "high": session.get("high"),
+            "low": session.get("low"),
+            "volume": int(session["volume"]) if session.get("volume") is not None else None,
+            "market_status": raw.get("market_status"),
+            "last_trade_price": last_trade.get("price") if last_trade else None,
+            "as_of": as_of,
+            # Close of the most recent minute aggregate — the consolidated last
+            # sale. Unlike last_trade (and the session change fields derived
+            # from it), it excludes odd-lot prints that don't update the
+            # official last, so it matches what the chart's bars show.
+            "last_minute_close": last_minute.get("close") if last_minute else None,
+            # Provider-exact regular-session close. `price` maps the same wire
+            # field, but downstream live-tick write-through overwrites `price`,
+            # so the settled close needs its own untouched key. The provider's
+            # change fields are served at reduced precision (1dp) — deriving
+            # the close from them is off by cents; this field is exact.
+            "regular_close": session.get("close"),
+            "regular_trading_change": session.get("regular_trading_change"),
+            "regular_trading_change_percent": session.get("regular_trading_change_percent"),
+            "early_trading_change": session.get("early_trading_change"),
+            "early_trading_change_percent": session.get("early_trading_change_percent"),
+            "late_trading_change": session.get("late_trading_change"),
+            "late_trading_change_percent": session.get("late_trading_change_percent"),
+            # When the last trade printed: the shown price's own time, which a
+            # thin name's newer quote stamp in ``as_of`` does not share.
+            "last_trade_at": vendor_epoch_ms((last_trade or {}).get("last_updated")),
+        }
+
+    async def close(self) -> None:
+        await self.client.close()
+
+
+# Backward-compatible alias
+MarketBridgeDataPriceProvider = MarketBridgeDataSource

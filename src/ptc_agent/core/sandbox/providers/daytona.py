@@ -1,0 +1,763 @@
+"""Daytona sandbox provider — wraps the Daytona SDK."""
+
+import asyncio
+import contextlib
+import contextvars
+import uuid
+from collections.abc import Awaitable, Callable, Sequence
+from datetime import UTC, datetime
+from typing import Any
+
+import structlog
+from daytona import (
+    AsyncDaytona,
+    CreateSandboxFromSnapshotParams,
+    CreateSnapshotParams,
+    DaytonaConfig as SDKDaytonaConfig,
+    DaytonaNotFoundError,
+    Image,
+    Resources,
+)
+
+from ptc_agent.config.core import DaytonaConfig, PlatformSecretDefinition
+from ptc_agent.core.paths import DEFAULT_SANDBOX_ROOT
+from ptc_agent.core.sandbox._defaults import SANDBOX_FALLBACK_CPU
+from ptc_agent.core.sandbox.abandoned import report_abandoned
+from ptc_agent.core.sandbox.runtime import (
+    MetricSample,
+    RuntimeState,
+    SandboxAllocation,
+    SandboxFailureKind,
+    SandboxGoneError,
+    SandboxProvider,
+    SandboxRateLimitedError,
+)
+from ptc_agent.core.sandbox.platform_secrets import (
+    ReconciledPlatformSecret,
+    ResolvedPlatformSecret,
+)
+from ptc_agent.core.sandbox.providers._image_recipe import (
+    BASE_IMAGE,
+    Env,
+    Run,
+    Step,
+    config_hash,
+    image_identity,
+    image_steps,
+)
+from ptc_agent.core.sandbox.providers._metrics import normalize_samples
+from ptc_agent.core.sandbox.providers._tiers import TierChoice, resolve_tier
+from ptc_agent.core.sandbox.providers.daytona_runtime import (
+    _STATE_MAP,
+    DaytonaRuntime,
+    _raw_state,
+)
+from ptc_agent.core.sandbox.providers._daytona_errors import (
+    daytona_error_code as _daytona_error_code,
+    daytona_error_status as _daytona_error_status,
+    is_daytona_host_unavailable,
+    is_transient_daytona_error,
+)
+from ptc_agent.core.sandbox.providers.daytona_secrets import DaytonaSecretReconciler
+
+logger = structlog.get_logger(__name__)
+
+# A snapshot in one of these is on its way to active (or, removing, to gone).
+_SNAPSHOT_IN_PROGRESS = frozenset(
+    {"pending", "pulling", "building", "snapshotting", "removing"}
+)
+_SNAPSHOT_FAILED = frozenset({"build_failed", "error"})
+
+# Every command the agent runs goes through one of these. A runner can serve
+# the wrong image for a snapshot ref (a bare busybox rootfs under Daytona's
+# default snapshot on one runner), and placement is per create, so a second
+# sandbox almost always lands on a healthy runner.
+_REQUIRED_TOOLS = ("bash", "python3", "uv")
+_REQUIRED_TOOLS_CHECK = (
+    f"for t in {' '.join(_REQUIRED_TOOLS)}; do command -v $t >/dev/null 2>&1 || echo $t; done"
+)
+
+
+# What a failed create may spend finding and deleting the sandbox it named,
+# past which the name goes to the abandoned-sandbox sweep instead.
+_RECLAIM_BUDGET_S = 30
+
+
+async def _shielded[T](work: Awaitable[T]) -> T:
+    """Run *work* to its end even when the caller is cancelled.
+
+    Waited on when cancelled, so a cancelled create still cleans up what it
+    made before the caller closes the Daytona client.
+    """
+    task = asyncio.ensure_future(work)
+    task.add_done_callback(lambda t: t.cancelled() or t.exception())
+    try:
+        return await asyncio.shield(task)
+    except asyncio.CancelledError:
+        await asyncio.wait({task})
+        raise
+
+
+class SandboxImageBrokenError(RuntimeError):
+    """Daytona twice created a sandbox whose image lacks the tools every command needs."""
+
+
+def _state_value(state: Any) -> str:
+    return state.value if hasattr(state, "value") else str(state)
+
+
+# What the usage ledger reads a Daytona state as. A paused VM holds its disk
+# as a stopped container does, and one still pausing bills as running, as a
+# stopping one does; only an outright failure reads as an error, which ends
+# the hold. Any other state (unknown, snapshotting, resizing, a delete still
+# settling) reads as None, which decides nothing.
+_ALLOCATION_STATES: dict[str, RuntimeState] = {
+    **_STATE_MAP,
+    "paused": RuntimeState.STOPPED,
+    "pausing": RuntimeState.STOPPING,
+    "build_failed": RuntimeState.ERROR,
+}
+_ALLOCATION_GONE_STATES = frozenset({"destroyed"})
+# The auto-archive interval an interval of 0 asks for, Daytona's longest
+# (its sandbox docs, read 2026-11-12).
+_LONGEST_ARCHIVE_S = 30 * 24 * 3600
+
+
+def _float_or_none(value: Any) -> float | None:
+    return float(value) if isinstance(value, (int, float)) else None
+
+
+def _detach_event_dispatcher(client: AsyncDaytona) -> None:
+    """Start the SDK's event-socket tasks outside the caller's context.
+
+    The client is built lazily during a turn, and its dispatcher reconnects
+    from ``subscribe`` calls made during later turns. A task copies the context
+    it is created in, so the socket's long-lived tasks would otherwise pin a
+    turn's request-scoped state for the client's whole life. The dispatcher
+    is SDK-private; if it moves, this warns rather than fail.
+    """
+    dispatcher = getattr(client, "_event_dispatcher", None)
+    ensure_connected = getattr(dispatcher, "ensure_connected", None)
+    if ensure_connected is None:
+        logger.warning(
+            "Daytona event dispatcher hook not found; its socket tasks will "
+            "pin the context of the turn that starts them"
+        )
+        return
+    dispatcher.ensure_connected = lambda: contextvars.Context().run(ensure_connected)
+
+
+class DaytonaProvider(SandboxProvider):
+    """Provider that manages sandboxes via the Daytona SDK."""
+
+    label = "Daytona"
+    platform_secret_namespace_env = DaytonaConfig.ENV_FIELDS["secret_namespace"]
+    scrubs_platform_secrets = True
+    reports_metrics = True
+    reports_allocation = True
+
+    def __init__(
+        self,
+        config: DaytonaConfig,
+        working_dir: str | None = None,
+        *,
+        # Daytona holds a Secret's routing itself, so the catalog is not needed.
+        platform_secrets: Sequence[PlatformSecretDefinition] = (),
+    ) -> None:
+        self._config = config
+        self._working_dir = working_dir or DEFAULT_SANDBOX_ROOT
+        sdk_config = SDKDaytonaConfig(api_key=config.api_key, api_url=config.base_url)
+        self._client = contextvars.Context().run(AsyncDaytona, sdk_config)
+        _detach_event_dispatcher(self._client)
+
+    # -- SandboxProvider interface --
+
+    async def create(
+        self,
+        *,
+        env_vars: dict[str, str] | None = None,
+        platform_secret_bindings: dict[str, str] | None = None,
+        mcp_packages: list[str] | None = None,
+        tier: str | None = None,
+        auto_stop_minutes: int | None = None,
+        **kwargs: Any,
+    ) -> DaytonaRuntime:
+        """Create a new Daytona sandbox, optionally from a snapshot.
+
+        Args:
+            env_vars: Environment variables injected at creation time.
+            platform_secret_bindings: Environment-variable to organization
+                Secret-name mappings mounted by Daytona.
+            mcp_packages: NPM packages for MCP servers (needed for snapshot).
+            tier: Resource tier name. Hosted Daytona can't resize a snapshot
+                sandbox or override its resources at create time, so a tier's
+                cpu/mem/disk is baked into a tier-specific snapshot. ``None``
+                resolves to the configured default tier, whose size is applied
+                the same way. An unknown (removed-from-config) tier falls back to
+                a base-sized sandbox so the workspace stays recoverable.
+            auto_stop_minutes: Auto-stop interval override in minutes (0 disables,
+                for always-on). ``None`` uses the configured default.
+            **kwargs: Extra keyword arguments (reserved for future use).
+
+        Returns:
+            A DaytonaRuntime wrapping the new sandbox.
+        """
+        choice, resources = self._resolve_tier(tier)
+        snapshot_name = await self._ensure_snapshot(
+            mcp_packages=mcp_packages or [],
+            tier=choice.name,
+            resources=resources,
+        )
+
+        # An elevated (non-default) tier's size lives only in its snapshot. If
+        # that snapshot's BUILD failed, creating from the base (snapshot=None)
+        # would silently under-provision a billed tier — fail loudly so the caller
+        # (e.g. set_workspace_spec) reverts the tier instead of charging for a
+        # size the user never received. Guarded on snapshot_enabled so a globally
+        # snapshots-disabled deployment still creates a base-sized sandbox rather
+        # than raising (it never expected a sized snapshot in the first place).
+        # The default tier is exempt: base-sized ~= default, so a missing default
+        # snapshot degrades gracefully instead of hard-failing sandbox creation.
+        if choice.elevated and snapshot_name is None and self._config.snapshot_enabled:
+            raise RuntimeError(
+                f"Could not provision the {choice.name!r} tier snapshot; "
+                "refusing to create a base-sized sandbox for an elevated tier"
+            )
+
+        auto_stop = (
+            auto_stop_minutes
+            if auto_stop_minutes is not None
+            else self._config.auto_stop_interval // 60
+        )
+        params = CreateSandboxFromSnapshotParams(
+            snapshot=snapshot_name if snapshot_name else None,
+            env_vars=env_vars or None,
+            secrets=platform_secret_bindings or None,
+            auto_stop_interval=auto_stop,
+            auto_archive_interval=self._config.auto_archive_interval // 60,
+            auto_delete_interval=self._config.auto_delete_interval // 60,
+        )
+
+        missing: list[str] = []
+        for attempt in (1, 2):
+            sdk_sandbox = await self._create_named(params)
+            try:
+                missing = await self._missing_tools(sdk_sandbox)
+            except BaseException:
+                await _shielded(self._discard(sdk_sandbox, "its tools check failed"))
+                raise
+            if not missing:
+                return DaytonaRuntime(
+                    sdk_sandbox,
+                    snapshot_name=snapshot_name,
+                    default_working_dir=self._working_dir,
+                )
+            logger.warning(
+                "Daytona sandbox came up without required tools; replacing it",
+                sandbox_id=sdk_sandbox.id,
+                snapshot=snapshot_name or "Daytona default",
+                missing=missing,
+                attempt=attempt,
+            )
+            await _shielded(
+                self._discard(sdk_sandbox, f"image lacks {', '.join(missing)}")
+            )
+        raise SandboxImageBrokenError(
+            f"Daytona created two sandboxes from "
+            f"{snapshot_name or 'its default snapshot'} without "
+            f"{', '.join(missing)}: the image it serves for that snapshot is broken"
+        )
+
+    async def _create_named(self, params: CreateSandboxFromSnapshotParams) -> Any:
+        """Create under a name of our own, so a create given up on can be found.
+
+        Daytona answers only once the sandbox runs and keeps building one the
+        caller stopped waiting for, which then runs with nothing holding it.
+        So any failure reclaims the name.
+        """
+        params.name = str(uuid.uuid4())
+        try:
+            return await self._client.create(
+                params, timeout=self._config.create_timeout_seconds
+            )
+        except BaseException as e:
+            # Even a client error: the SDK raises one from its wait for the
+            # start as well, after the sandbox exists.
+            await _shielded(
+                self._reclaim(params.name, f"create failed: {type(e).__name__}")
+            )
+            raise
+
+    async def _reclaim(self, name: str, reason: str) -> None:
+        """Discard the sandbox a failed create named, or report the name.
+
+        A name nothing answers to yet is reported too: a create the API took
+        late can still land after the lookup, and the sweep drops the name
+        once it stays absent.
+        """
+        try:
+            async with asyncio.timeout(_RECLAIM_BUDGET_S):
+                sdk_sandbox = await self._client.get(name)
+        except Exception as e:
+            await report_abandoned("daytona", name, f"{reason}; {type(e).__name__} on lookup")
+            return
+        await self._discard(sdk_sandbox, reason)
+
+    async def _discard(self, sdk_sandbox: Any, reason: str) -> None:
+        """Delete a sandbox nothing holds; one Daytona will not let go of yet
+        goes to the abandoned-sandbox sweep. Callers shield it from their own
+        cancellation, so it runs to its end."""
+        try:
+            async with asyncio.timeout(_RECLAIM_BUDGET_S):
+                if await self._delete(sdk_sandbox):
+                    return
+            reason = f"{reason}; Daytona refused to delete it yet"
+        except Exception as e:
+            reason = f"{reason}; delete failed: {type(e).__name__}"
+        logger.warning("Left a sandbox for the sweep", sandbox_id=sdk_sandbox.id, reason=reason)
+        await report_abandoned("daytona", sdk_sandbox.id, reason)
+
+    async def remove_abandoned(self, ref: str) -> bool:
+        try:
+            sdk_sandbox = await self._client.get(ref)
+        except Exception as e:
+            if self.classify_error(e) is SandboxFailureKind.SANDBOX_GONE:
+                return True
+            raise
+        # Daytona lists a deleted sandbox for a while before it 404s.
+        if _state_value(sdk_sandbox.state) in ("destroyed", "destroying"):
+            return True
+        return await self._delete(sdk_sandbox)
+
+    async def _delete(self, sdk_sandbox: Any) -> bool:
+        """Delete, retrying a transient refusal. False while Daytona refuses
+        because the sandbox is mid-transition (409), which only time settles."""
+        for delay in (1, 2, None):
+            try:
+                await self._client.delete(sdk_sandbox)
+                return True
+            except Exception as e:
+                if _daytona_error_status(e) == 409:
+                    return False
+                kind = self.classify_error(e)
+                if kind is SandboxFailureKind.SANDBOX_GONE:
+                    return True
+                if delay is None or kind is not SandboxFailureKind.TRANSIENT:
+                    raise
+                await asyncio.sleep(delay)
+        raise AssertionError("unreachable")
+
+    async def _missing_tools(self, sdk_sandbox: Any) -> list[str]:
+        """The required tools the sandbox lacks.
+
+        Create returns once the sandbox is started, which can be a beat before
+        its toolbox answers, so a transient failure is retried on the same
+        sandbox rather than costing it.
+        """
+        for delay in (1, 2, 4, None):
+            try:
+                check = await sdk_sandbox.process.exec(_REQUIRED_TOOLS_CHECK, timeout=30)
+            except Exception as e:
+                if delay is None or self.classify_error(e) is not SandboxFailureKind.TRANSIENT:
+                    raise
+                await asyncio.sleep(delay)
+                continue
+            # The result carries stderr too, so a shell's own noise is not a tool.
+            missing = [t for t in (check.result or "").split() if t in _REQUIRED_TOOLS]
+            if check.exit_code and not missing:
+                return [f"a shell that runs the check (it exited {check.exit_code})"]
+            return missing
+        raise AssertionError("unreachable")
+
+    async def get(self, sandbox_id: str) -> DaytonaRuntime:
+        sdk_sandbox = await self._client.get(sandbox_id)
+        return DaytonaRuntime(
+            sdk_sandbox,
+            default_working_dir=self._working_dir,
+        )
+
+    @property
+    def default_archive_after_s(self) -> int | None:
+        return self._config.auto_archive_interval or _LONGEST_ARCHIVE_S
+
+    async def allocation(self, sandbox_id: str) -> SandboxAllocation:
+        # A control-plane read, not the metrics backend, so it spends none of
+        # that backend's budget. Only a container is archived; stopping a VM
+        # already offloads its filesystem and frees its disk, as an archive
+        # does a container's, so a stopped VM reads as archived.
+        sdk_sandbox = await self._client.get(sandbox_id)
+        raw = _raw_state(sdk_sandbox) or ""
+        if raw in _ALLOCATION_GONE_STATES:
+            raise SandboxGoneError(sandbox_id, f"Daytona reports it {raw}")
+        archive_min = getattr(sdk_sandbox, "auto_archive_interval", None)
+        archivable = getattr(sdk_sandbox, "sandbox_class", None) in (
+            None,
+            "container",
+        )
+        stopped_vm = raw == "stopped" and not archivable
+        return SandboxAllocation(
+            state=(
+                RuntimeState.ARCHIVED if stopped_vm else _ALLOCATION_STATES.get(raw)
+            ),
+            cpu=_float_or_none(getattr(sdk_sandbox, "cpu", None)),
+            memory_gb=_float_or_none(getattr(sdk_sandbox, "memory", None)),
+            disk_gb=_float_or_none(getattr(sdk_sandbox, "disk", None)),
+            archive_after_s=(
+                int(archive_min) * 60 or _LONGEST_ARCHIVE_S
+                if archivable and isinstance(archive_min, (int, float))
+                else None
+            ),
+        )
+
+    async def metrics_since(
+        self,
+        sandbox_id: str,
+        since: datetime,
+        *,
+        until: datetime | None = None,
+    ) -> list[MetricSample]:
+        # ``get`` is an API lookup that leaves a stopped sandbox stopped.
+        # History is the telemetry backend's aggregated buckets, kept 3 days.
+        # That backend has a rate limit of its own, far below the control
+        # plane's (measured 2026-10-23: about 40 reads at once, then about 1/s),
+        # and refuses with a bare DaytonaError whose 429 is only on its cause.
+        try:
+            sdk_sandbox = await self._client.get(sandbox_id)
+            raw = await sdk_sandbox.get_metrics(since, until or datetime.now(UTC))
+        except Exception as e:
+            if _daytona_error_status(e) == 429:
+                raise SandboxRateLimitedError(str(e).split("\n", 1)[0]) from e
+            raise
+        return normalize_samples(raw, since, until)
+
+    async def close(self) -> None:
+        try:
+            await self._client.close()
+        except Exception as e:
+            logger.debug("Failed to close Daytona client", error=str(e))
+
+    async def reconcile_platform_secrets(
+        self, secrets: Sequence[ResolvedPlatformSecret]
+    ) -> tuple[ReconciledPlatformSecret, ...]:
+        """Create or update every required organization-scoped Secret."""
+
+        return await DaytonaSecretReconciler(self._client).reconcile(secrets)
+
+    def is_transient_error(self, exc: Exception) -> bool:
+        """Classify whether *exc* is a transient Daytona SDK error."""
+        return is_transient_daytona_error(exc)
+
+    def is_host_unavailable(self, exc: Exception) -> bool:
+        return is_daytona_host_unavailable(exc)
+
+    def classify_error(self, exc: Exception) -> SandboxFailureKind:
+        """Classify a Daytona failure from its structured error metadata.
+
+        ``DaytonaError`` carries ``status_code`` and a machine-readable
+        ``error_code``; both are needed because a missing *file* and a missing
+        *sandbox* are both HTTP 404. Measured against the live API (SDK 0.200.1):
+        a per-path miss reports ``FILE_NOT_FOUND``, a dead sandbox reports
+        ``NOT_FOUND``, and a bulk-download against a deleted sandbox reports
+        *neither* — it arrives with no status at all, which is why status-less
+        failures must stay ``UNKNOWN`` instead of collapsing into "absent".
+
+        Absence is checked before ``is_transient_daytona_error`` for the reason
+        the base classifier gives: that helper scans the message, and the server
+        echoes the path into it ("file not found: /home/workspace/x.log"), so a
+        missing file named ``session_timeout.log`` read as a timeout and turned
+        an ordinary 404 into a permanent 503. The 404 → ``SANDBOX_GONE`` check
+        deliberately stays *after* the scan: gone authorizes destroying and
+        replacing the sandbox, so a transient-looking failure must not reach it.
+        """
+        error_code = _daytona_error_code(exc)
+        if error_code == "FILE_NOT_FOUND":
+            return SandboxFailureKind.PATH_ABSENT
+
+        if is_transient_daytona_error(exc):
+            return SandboxFailureKind.TRANSIENT
+
+        status = _daytona_error_status(exc)
+        if status == 404:
+            return SandboxFailureKind.SANDBOX_GONE
+        if status == 429 or (status is not None and 500 <= status <= 599):
+            return SandboxFailureKind.TRANSIENT
+        return SandboxFailureKind.UNKNOWN
+
+    # -- Snapshot management --
+
+    def _resolve_tier(self, tier: str | None) -> tuple[TierChoice, Resources | None]:
+        """The tier ``create`` uses and the size baked into its snapshot.
+
+        Resolved for every tier uniformly (including the default) so the
+        configured default-tier cpu/mem/disk actually take effect instead of
+        falling through to the Daytona platform default.
+        """
+        choice = resolve_tier(
+            tier,
+            default_tier=self._config.default_tier,
+            resource_tiers=self._config.resource_tiers,
+        )
+        if choice.preset is None:
+            return choice, None
+        preset = choice.preset
+        return choice, Resources(cpu=preset.cpu, memory=preset.memory, disk=preset.disk)
+
+    def snapshot_name(self, mcp_packages: list[str], *, tier: str | None = None) -> str:
+        """The snapshot ``create`` starts a sandbox of ``tier`` from."""
+        choice, resources = self._resolve_tier(tier)
+        return self._snapshot_name(mcp_packages, choice.name, resources)
+
+    async def snapshot_state(self, name: str) -> str | None:
+        """Daytona's state for the snapshot (``active``, ``building``, ...), None if absent."""
+        try:
+            snapshot = await self._client.snapshot.get(name)
+        except DaytonaNotFoundError:
+            return None
+        return _state_value(snapshot.state)
+
+    async def build_snapshot(
+        self,
+        mcp_packages: list[str],
+        *,
+        tier: str | None = None,
+        on_log: Callable[[str], None] | None = None,
+    ) -> str:
+        """Build ``tier``'s snapshot and wait until it is active; raises if the build fails.
+
+        A snapshot whose last build failed holds the name, so it is removed
+        first, and the build starts once Daytona has let the name go.
+        """
+        choice, resources = self._resolve_tier(tier)
+        name = self._snapshot_name(mcp_packages, choice.name, resources)
+        if await self.snapshot_state(name) in _SNAPSHOT_FAILED:
+            # A server's first create removes a failed snapshot too, and may get there first.
+            with contextlib.suppress(DaytonaNotFoundError):
+                await self._client.snapshot.delete(name)
+            for _ in range(60):
+                if await self.snapshot_state(name) is None:
+                    break
+                await asyncio.sleep(2)
+            else:
+                raise RuntimeError(
+                    f"{name} is still being removed; rerun once it is gone"
+                )
+        await self._create_snapshot(name, mcp_packages, resources, on_log=on_log)
+        return name
+
+    async def _settled_snapshot_state(self, name: str) -> str | None:
+        """The snapshot's state once no build is under way, or after five minutes.
+
+        A build started elsewhere (another worker's first create, or
+        ``make daytona-snapshots``) passes through several states on its way to
+        active, and a sandbox created from it before then fails.
+        """
+        state: str | None = "pending"
+        for _ in range(60):
+            with contextlib.suppress(Exception):
+                state = await self.snapshot_state(name)
+            if state not in _SNAPSHOT_IN_PROGRESS:
+                return state
+            await asyncio.sleep(5)
+        return state
+
+    async def activate_snapshot(self, name: str) -> str:
+        """Make an inactive snapshot usable again; returns the state Daytona reports for it."""
+        return _state_value((await self._client.snapshot.activate(name)).state)
+
+    def _snapshot_name(
+        self, mcp_packages: list[str] | None, tier: str, resources: Resources | None
+    ) -> str:
+        config_hash = self._get_snapshot_hash(mcp_packages, resources=resources)
+        base_name = self._config.snapshot_name or "ptc-base"
+        if resources is not None:
+            return f"{base_name}-{tier}-{config_hash}"
+        return f"{base_name}-{config_hash}"
+
+    async def _create_snapshot(
+        self,
+        name: str,
+        mcp_packages: list[str] | None,
+        resources: Resources | None,
+        *,
+        on_log: Callable[[str], None] | None = None,
+    ) -> None:
+        image = self._create_snapshot_image(mcp_packages, resources=resources)
+        await self._client.snapshot.create(
+            CreateSnapshotParams(name=name, image=image, resources=resources),
+            on_logs=on_log or (lambda log: logger.debug("Snapshot build", log=log)),
+        )
+
+    def _image_steps(
+        self, mcp_packages: list[str] | None, resources: Resources | None
+    ) -> list[Step]:
+        return image_steps(
+            working_dir=self._working_dir,
+            mcp_packages=mcp_packages,
+            cpu=resources.cpu if resources is not None else SANDBOX_FALLBACK_CPU,
+        )
+
+    def _get_snapshot_hash(
+        self,
+        mcp_packages: list[str] | None = None,
+        *,
+        resources: Resources | None = None,
+    ) -> str:
+        """Generate an 8-char hash for snapshot versioning (see ``image_identity``)."""
+        steps = self._image_steps(mcp_packages, resources)
+        return config_hash(image_identity(steps, resources))
+
+    def _create_snapshot_image(
+        self,
+        mcp_packages: list[str] | None = None,
+        *,
+        resources: Resources | None = None,
+    ) -> Image:
+        """Translate the shared image recipe into Daytona's Image DSL."""
+        image = Image.base(BASE_IMAGE)
+        for step in self._image_steps(mcp_packages, resources):
+            if isinstance(step, Run):
+                image = image.run_commands(*step.commands)
+            elif isinstance(step, Env):
+                image = image.env(dict(step.values))
+            else:
+                image = image.workdir(step.path)
+
+        logger.info(
+            "Created snapshot image definition",
+            mcp_packages=sorted(mcp_packages or []),
+            thread_cpu=resources.cpu if resources is not None else SANDBOX_FALLBACK_CPU,
+        )
+        return image
+
+    async def _ensure_snapshot(
+        self,
+        mcp_packages: list[str] | None = None,
+        *,
+        tier: str | None = None,
+        resources: Resources | None = None,
+    ) -> str | None:
+        """Ensure a snapshot exists for the current configuration.
+
+        When ``resources`` is given (a non-default tier), they're baked into a
+        tier-specific snapshot — the only way to size a snapshot-born sandbox on
+        hosted Daytona, which supports neither runtime resize nor per-sandbox
+        resource overrides.
+
+        Returns:
+            Snapshot name if available, None otherwise.
+        """
+        if not self._config.snapshot_enabled:
+            logger.debug("Snapshot feature disabled in config")
+            return None
+
+        snapshot_name = self._snapshot_name(
+            mcp_packages, tier or self._config.default_tier, resources
+        )
+        logger.info("Checking for snapshot", snapshot_name=snapshot_name)
+
+        # Check if snapshot exists and is usable
+        try:
+            snapshots_result = await self._client.snapshot.list()
+            snapshots = (
+                snapshots_result.items
+                if hasattr(snapshots_result, "items")
+                else snapshots_result
+            )
+
+            snapshot_obj = None
+            for s in snapshots:
+                if hasattr(s, "name") and s.name == snapshot_name:
+                    snapshot_obj = s
+                    break
+
+            if snapshot_obj:
+                state = _state_value(snapshot_obj.state)
+                if state == "build_failed":
+                    logger.warning(
+                        "Found failed snapshot, will recreate",
+                        snapshot_name=snapshot_name,
+                        error=snapshot_obj.error_reason,
+                    )
+                    try:
+                        await self._client.snapshot.delete(snapshot_obj)
+                        logger.info(
+                            "Deleted failed snapshot",
+                            snapshot_name=snapshot_name,
+                        )
+                        await asyncio.sleep(2)
+                    except Exception as del_err:
+                        logger.warning(
+                            "Could not delete failed snapshot",
+                            error=str(del_err),
+                        )
+                    snapshot_exists = False
+                elif state == "active":
+                    snapshot_exists = True
+                elif state == "inactive":
+                    # Daytona refuses to create a sandbox from an inactive
+                    # snapshot, and deactivates one left unused for a while.
+                    logger.info("Activating snapshot", snapshot_name=snapshot_name)
+                    state = await self.activate_snapshot(snapshot_name)
+                    if state != "active":
+                        state = await self._settled_snapshot_state(snapshot_name)
+                    snapshot_exists = state == "active"
+                elif state in _SNAPSHOT_IN_PROGRESS:
+                    logger.info(
+                        "Snapshot is still building, waiting...",
+                        snapshot_name=snapshot_name,
+                        state=state,
+                    )
+                    state = await self._settled_snapshot_state(snapshot_name)
+                    if state in _SNAPSHOT_IN_PROGRESS:
+                        logger.warning(
+                            "Snapshot build timed out", snapshot_name=snapshot_name
+                        )
+                        return None
+                    snapshot_exists = state == "active"
+                else:
+                    logger.warning(f"Snapshot in unexpected state: {state}")
+                    snapshot_exists = False
+            else:
+                snapshot_exists = False
+
+        except Exception as e:
+            logger.warning("Error listing snapshots", error=str(e))
+            snapshot_exists = False
+
+        # Create snapshot if it doesn't exist
+        if not snapshot_exists and self._config.snapshot_auto_create:
+            logger.info("Creating snapshot", snapshot_name=snapshot_name)
+            try:
+                await self._create_snapshot(snapshot_name, mcp_packages, resources)
+                logger.info(
+                    "Snapshot created successfully",
+                    snapshot_name=snapshot_name,
+                )
+                return snapshot_name
+            except Exception as e:
+                error_str = str(e)
+                if "already exists" in error_str.lower():
+                    # Another build holds the name, and a sandbox can start
+                    # from it only once that build is done.
+                    state = await self._settled_snapshot_state(snapshot_name)
+                    if state != "active":
+                        logger.error(
+                            "Snapshot another build holds is not usable",
+                            snapshot_name=snapshot_name,
+                            state=state,
+                        )
+                        return None
+                    logger.info(
+                        "Snapshot already exists, will use it",
+                        snapshot_name=snapshot_name,
+                    )
+                    return snapshot_name
+                logger.error("Failed to create snapshot", error=error_str)
+                return None
+
+        if snapshot_exists:
+            logger.info("Using existing snapshot", snapshot_name=snapshot_name)
+            return snapshot_name
+
+        logger.warning("Snapshot not found and auto_create disabled")
+        return None

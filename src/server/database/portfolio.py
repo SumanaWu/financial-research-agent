@@ -1,0 +1,463 @@
+"""
+Database utility functions for portfolio management.
+
+Provides functions for creating, retrieving, updating, and deleting
+portfolio holdings in PostgreSQL.
+"""
+
+import logging
+from datetime import datetime
+from decimal import Context, Decimal
+from typing import Any, Dict, List, Optional
+from uuid import uuid4
+
+from market_protocol import AssetClass, to_canonical
+from market_protocol.symbology import MINOR_UNIT_PLACES
+from psycopg.rows import dict_row
+from psycopg.types.json import Json
+
+from src.data_client.normalize import listing_currency
+from src.server.database.pool import get_db_connection
+from src.server.database.user_lock import lock_user_profile
+from src.server.models.user import normalize_symbol
+from src.server.utils.db import UpdateQueryBuilder
+
+logger = logging.getLogger(__name__)
+
+
+class HoldingCurrencyMismatch(ValueError):
+    """A write's currency cannot be the one the holding's average cost is in.
+
+    Merging would average two costs in different currencies, relabeling a
+    holding as pence without its cost would read the stored pounds as pence,
+    and a new holding on a venue whose currency is unknown has none to default
+    to, so the write is refused. A distinct type so a caller answers it as a
+    conflict without reading every ValueError as one.
+    """
+
+
+# The holding types the protocol reads as something other than a listed
+# security: BTC-EUR held as crypto is priced in euros, not a US ticker in
+# dollars. Every other type is a listed security, and the equity hint keeps a
+# ticker such as HSI from reading as the index.
+_ASSET_CLASS_OF_TYPE = {
+    "index": AssetClass.INDEX,
+    "crypto": AssetClass.CRYPTO,
+    "currency": AssetClass.FX,
+}
+
+
+# The holding types that are listed shares, whose currency is their venue's.
+# Any other type (cash, a bond) on a venue the protocol does not know keeps
+# the USD default rather than being refused.
+_LISTED_TYPES = frozenset({"stock", "etf", "fund", "adr", "reit"})
+
+
+# Search labels London listings in pence, but every quote the app serves for
+# them is in pounds. Pence is GBX in any case, or GBp, where case is all that
+# tells it from GBP: upper-cased, a pence cost used to pass for a pounds one.
+_MAJOR_OF_MINOR = {"GBX": "GBP"}
+
+# A weighted average rarely terminates. Twelve significant digits keep a
+# sub-cent cost (0.00001234) exact to a part in 10^12 and keep the 28-digit
+# expansion out of the unconstrained column and everything that prints it.
+_MERGED_COST = Context(prec=12)
+
+
+def _minor_unit(currency: str) -> Optional[str]:
+    code = currency.strip()
+    unit = "GBX" if code == "GBp" else code.upper()
+    return unit if unit in _MAJOR_OF_MINOR else None
+
+
+def canonical_holding_cost(
+    currency: Optional[str], average_cost: Optional[Decimal]
+) -> tuple[Optional[str], Optional[Decimal]]:
+    """The currency and average cost a holding is stored in.
+
+    A cost in pence is stored in pounds, the unit its quotes are read in, so
+    two costs in one holding always compare. Every writer of a holding passes
+    its currency through here, so the merge guard can compare codes exactly.
+    """
+    if currency is None:
+        return None, average_cost
+    unit = _minor_unit(currency)
+    if unit:
+        places = MINOR_UNIT_PLACES[unit]
+        return _MAJOR_OF_MINOR[unit], None if average_cost is None else average_cost.scaleb(-places)
+    return currency.strip().upper() or None, average_cost
+
+
+def default_holding_currency(symbol: str, instrument_type: str) -> Optional[str]:
+    """The currency a holding is written in when the writer names none.
+
+    The one its quotes are in, since the average cost is read against them. A
+    symbol the protocol cannot read is still stored, in USD as before. A
+    stock or ETF on a venue the protocol does not know has no currency to
+    take, so None: the writer has to name one. Any other type there (a cash
+    line, a bond) is no listing whose currency is missing, and keeps USD.
+    """
+    hint = _ASSET_CLASS_OF_TYPE.get(instrument_type, AssetClass.EQUITY)
+    try:
+        ref = to_canonical(symbol, asset_class=hint)
+    except ValueError:
+        return "USD"
+    currency = listing_currency(ref)
+    if currency is None and instrument_type not in _LISTED_TYPES:
+        return "USD"
+    return currency
+
+
+def unknown_currency_message(symbol: str) -> str:
+    """Why a new holding with no currency on an unknown venue is refused."""
+    return (
+        f"{symbol} is listed on a venue whose currency is not known here, so the "
+        f"holding has no currency to default to. Give the currency its average cost "
+        f"is in: the one the listing trades in, unless the cost was paid in another."
+    )
+
+
+async def get_user_portfolio(user_id: str) -> List[Dict[str, Any]]:
+    """
+    Get all portfolio holdings for a user.
+
+    Args:
+        user_id: User ID
+
+    Returns:
+        List of portfolio holding dicts
+    """
+    async with get_db_connection() as conn:
+        async with conn.cursor(row_factory=dict_row) as cur:
+            await cur.execute("""
+                SELECT
+                    user_portfolio_id, user_id, symbol, instrument_type, exchange,
+                    name, quantity, average_cost, currency, account_name,
+                    notes, metadata, first_purchased_at, created_at, updated_at
+                FROM user_portfolios
+                WHERE user_id = %s
+                ORDER BY created_at DESC
+            """, (user_id,))
+
+            results = await cur.fetchall()
+            return [dict(row) for row in results]
+
+
+async def get_portfolio_holding(
+    user_portfolio_id: str,
+    user_id: str
+) -> Optional[Dict[str, Any]]:
+    """
+    Get a single portfolio holding by ID.
+
+    Args:
+        user_portfolio_id: Portfolio holding ID
+        user_id: User ID (for ownership verification)
+
+    Returns:
+        Portfolio holding dict or None if not found
+    """
+    async with get_db_connection() as conn:
+        async with conn.cursor(row_factory=dict_row) as cur:
+            await cur.execute("""
+                SELECT
+                    user_portfolio_id, user_id, symbol, instrument_type, exchange,
+                    name, quantity, average_cost, currency, account_name,
+                    notes, metadata, first_purchased_at, created_at, updated_at
+                FROM user_portfolios
+                WHERE user_portfolio_id = %s AND user_id = %s
+            """, (user_portfolio_id, user_id))
+
+            result = await cur.fetchone()
+            return dict(result) if result else None
+
+
+async def update_portfolio_holding(
+    user_portfolio_id: str,
+    user_id: str,
+    name: Optional[str] = None,
+    quantity: Optional[Decimal] = None,
+    average_cost: Optional[Decimal] = None,
+    currency: Optional[str] = None,
+    account_name: Optional[str] = None,
+    notes: Optional[str] = None,
+    metadata: Optional[Dict[str, Any]] = None,
+    first_purchased_at: Optional[datetime] = None,
+) -> Optional[Dict[str, Any]]:
+    """
+    Update a portfolio holding.
+
+    Only updates fields that are provided (not None).
+
+    Args:
+        user_portfolio_id: Portfolio holding ID
+        user_id: User ID (for ownership verification)
+        name: New name
+        quantity: New quantity
+        average_cost: New average cost
+        currency: New currency
+        account_name: New account name
+        notes: New notes
+        metadata: New metadata
+        first_purchased_at: New first purchase date
+
+    Returns:
+        Updated portfolio holding dict or None if not found
+
+    Raises:
+        HoldingCurrencyMismatch: ``currency`` is a pence code without an
+            ``average_cost`` to convert to pounds, on a holding the caller owns.
+    """
+    if currency is not None and average_cost is None and _minor_unit(currency):
+        if not await get_portfolio_holding(user_portfolio_id, user_id):
+            return None
+        raise HoldingCurrencyMismatch(
+            f"{currency.strip()} is a cost in pence, which is stored in GBP. Give the "
+            f"average cost in the same write, or set the currency to GBP."
+        )
+    currency, average_cost = canonical_holding_cost(currency, average_cost)
+
+    builder = UpdateQueryBuilder()
+    builder.add_field("name", name)
+    builder.add_field("quantity", quantity)
+    builder.add_field("average_cost", average_cost)
+    builder.add_field("currency", currency)
+    builder.add_field("account_name", account_name)
+    builder.add_field("notes", notes)
+    builder.add_field("metadata", metadata, is_json=True)
+    builder.add_field("first_purchased_at", first_purchased_at)
+
+    if not builder.has_updates():
+        return await get_portfolio_holding(user_portfolio_id, user_id)
+
+    returning_columns = [
+        "user_portfolio_id", "user_id", "symbol", "instrument_type", "exchange",
+        "name", "quantity", "average_cost", "currency", "account_name",
+        "notes", "metadata", "first_purchased_at", "created_at", "updated_at",
+    ]
+
+    query, params = builder.build(
+        table="user_portfolios",
+        where_clause="user_portfolio_id = %s AND user_id = %s",
+        where_params=[user_portfolio_id, user_id],
+        returning_columns=returning_columns,
+    )
+
+    async with get_db_connection() as conn, conn.transaction():
+        async with conn.cursor(row_factory=dict_row) as cur:
+            await lock_user_profile(cur, user_id)
+            await cur.execute(query, params)
+
+            result = await cur.fetchone()
+            if result:
+                logger.info(
+                    f"[portfolio_db] update_portfolio_holding "
+                    f"user_portfolio_id={user_portfolio_id}"
+                )
+            return dict(result) if result else None
+
+
+async def upsert_portfolio_holding(
+    user_id: str,
+    symbol: str,
+    instrument_type: str,
+    quantity: Decimal,
+    exchange: Optional[str] = None,
+    name: Optional[str] = None,
+    average_cost: Optional[Decimal] = None,
+    currency: Optional[str] = None,
+    account_name: Optional[str] = None,
+    notes: Optional[str] = None,
+    metadata: Optional[Dict[str, Any]] = None,
+    first_purchased_at: Optional[datetime] = None,
+) -> tuple[Dict[str, Any], Optional[Dict[str, Any]]]:
+    """
+    Create or merge a portfolio holding.
+
+    If a holding already exists for the same (user_id, symbol, instrument_type, account_name),
+    merges the position by summing quantities and computing weighted average cost.
+
+    Args:
+        user_id: User ID
+        symbol: Instrument symbol
+        instrument_type: Type of instrument (stock, etf, etc.)
+        quantity: Number of units held
+        exchange: Exchange name
+        name: Full instrument name
+        average_cost: Average cost per unit
+        currency: Currency code, stored as ``canonical_holding_cost`` reads it.
+            Omitted, a new holding takes its listing's
+            (``default_holding_currency``) and a merge keeps the holding's.
+        account_name: Account name (e.g., 'Robinhood')
+        notes: User notes
+        metadata: Additional metadata
+        first_purchased_at: First purchase date
+
+    Returns:
+        Tuple of (holding dict, merge_details dict or None).
+        merge_details is None for fresh creates, or a dict with previous/added/result
+        when an existing position was merged.
+
+    Raises:
+        HoldingCurrencyMismatch: ``currency`` names another currency than the
+            existing holding's, or is omitted for a new holding on a venue
+            whose currency is unknown.
+    """
+    _returning = """
+        RETURNING
+            user_portfolio_id, user_id, symbol, instrument_type, exchange,
+            name, quantity, average_cost, currency, account_name,
+            notes, metadata, first_purchased_at, created_at, updated_at
+    """
+    symbol = normalize_symbol(symbol, instrument_type)
+    currency, average_cost = canonical_holding_cost(currency, average_cost)
+
+    async with get_db_connection() as conn:
+        # Explicit transaction for atomicity (autocommit is ON by default)
+        async with conn.transaction():
+            async with conn.cursor(row_factory=dict_row) as cur:
+                await lock_user_profile(cur, user_id)
+                # FOR UPDATE locks the row to prevent concurrent merge races
+                await cur.execute("""
+                    SELECT
+                        user_portfolio_id, user_id, symbol, instrument_type, exchange,
+                        name, quantity, average_cost, currency, account_name,
+                        notes, metadata, first_purchased_at, created_at, updated_at
+                    FROM user_portfolios
+                    WHERE user_id = %s AND symbol = %s AND instrument_type = %s
+                    AND account_name IS NOT DISTINCT FROM %s
+                    FOR UPDATE
+                """, (user_id, symbol, instrument_type, account_name))
+
+                existing = await cur.fetchone()
+
+                if existing:
+                    held_in = existing["currency"]
+                    if currency and held_in and currency != held_in:
+                        where = f" ({account_name})" if account_name else ""
+                        raise HoldingCurrencyMismatch(
+                            f"{symbol}{where} is held in {held_in}, so a cost in "
+                            f"{currency} cannot be averaged into it. Give the cost "
+                            f"in {held_in}, or change the holding's currency first."
+                        )
+
+                    existing_qty = existing["quantity"] or Decimal("0")
+                    total_qty = existing_qty + quantity
+
+                    # Weighted average cost (guard against zero total quantity)
+                    existing_cost = existing["average_cost"]
+                    if total_qty == 0:
+                        merged_avg_cost = None
+                    elif existing_cost is not None and average_cost is not None:
+                        merged_avg_cost = _MERGED_COST.divide(
+                            existing_qty * existing_cost + quantity * average_cost,
+                            total_qty,
+                        )
+                    elif average_cost is not None:
+                        merged_avg_cost = average_cost
+                    elif existing_cost is not None:
+                        merged_avg_cost = existing_cost
+                    else:
+                        merged_avg_cost = None
+
+                    # Keep the earlier first_purchased_at
+                    existing_date = existing["first_purchased_at"]
+                    if existing_date and first_purchased_at:
+                        merged_date = min(existing_date, first_purchased_at)
+                    else:
+                        merged_date = existing_date or first_purchased_at
+
+                    merged_name = name or existing["name"]
+                    merged_notes = notes or existing["notes"]
+
+                    def _dec_str(d):
+                        return format(d.normalize(), 'f')
+
+                    merge_details = {
+                        "previous": {
+                            "quantity": _dec_str(existing_qty),
+                            "average_cost": _dec_str(existing_cost) if existing_cost is not None else None,
+                        },
+                        "added": {
+                            "quantity": _dec_str(quantity),
+                            "average_cost": _dec_str(average_cost) if average_cost is not None else None,
+                        },
+                        "result": {
+                            "quantity": _dec_str(total_qty),
+                            "average_cost": _dec_str(merged_avg_cost) if merged_avg_cost is not None else None,
+                        },
+                    }
+
+                    await cur.execute(f"""
+                        UPDATE user_portfolios
+                        SET quantity = %s, average_cost = %s, name = %s, notes = %s,
+                            first_purchased_at = %s, updated_at = NOW()
+                        WHERE user_portfolio_id = %s AND user_id = %s
+                        {_returning}
+                    """, (
+                        total_qty, merged_avg_cost, merged_name, merged_notes,
+                        merged_date, existing["user_portfolio_id"], user_id,
+                    ))
+
+                    result = await cur.fetchone()
+                    logger.info(
+                        f"[portfolio_db] upsert_portfolio_holding merged "
+                        f"user_id={user_id} symbol={symbol}"
+                    )
+                    return dict(result), merge_details
+
+                else:
+                    user_portfolio_id = str(uuid4())
+                    currency = currency or default_holding_currency(symbol, instrument_type)
+                    if currency is None:
+                        raise HoldingCurrencyMismatch(unknown_currency_message(symbol))
+                    await cur.execute(f"""
+                        INSERT INTO user_portfolios (
+                            user_portfolio_id, user_id, symbol, instrument_type, exchange,
+                            name, quantity, average_cost, currency, account_name,
+                            notes, metadata, first_purchased_at, created_at, updated_at
+                        )
+                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW(), NOW())
+                        {_returning}
+                    """, (
+                        user_portfolio_id, user_id, symbol, instrument_type, exchange,
+                        name, quantity, average_cost, currency, account_name,
+                        notes,
+                        Json(metadata or {}),
+                        first_purchased_at,
+                    ))
+
+                    result = await cur.fetchone()
+                    logger.info(
+                        f"[portfolio_db] upsert_portfolio_holding created "
+                        f"user_id={user_id} symbol={symbol}"
+                    )
+                    return dict(result), None
+
+
+async def delete_portfolio_holding(user_portfolio_id: str, user_id: str) -> bool:
+    """
+    Delete a portfolio holding.
+
+    Args:
+        user_portfolio_id: Portfolio holding ID
+        user_id: User ID (for ownership verification)
+
+    Returns:
+        True if holding was deleted, False if not found
+    """
+    async with get_db_connection() as conn, conn.transaction():
+        async with conn.cursor() as cur:
+            await lock_user_profile(cur, user_id)
+            await cur.execute("""
+                DELETE FROM user_portfolios
+                WHERE user_portfolio_id = %s AND user_id = %s
+            """, (user_portfolio_id, user_id))
+
+            deleted = cur.rowcount > 0
+            if deleted:
+                logger.info(
+                    f"[portfolio_db] delete_portfolio_holding "
+                    f"user_portfolio_id={user_portfolio_id}"
+                )
+            return deleted

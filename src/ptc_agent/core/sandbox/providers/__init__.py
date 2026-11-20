@@ -1,0 +1,126 @@
+"""Sandbox provider factory."""
+
+from collections.abc import Sequence
+from importlib import import_module
+
+from ptc_agent.config.core import (
+    CoreConfig,
+    DaytonaConfig,
+    DockerConfig,
+    E2BConfig,
+    PlatformSecretDefinition,
+    SandboxConfig,
+    SSHConfig,
+)
+from ptc_agent.core.sandbox.runtime import SandboxProvider
+
+ProviderConfig = DaytonaConfig | DockerConfig | E2BConfig | SSHConfig
+
+# Imported on first use: each provider module loads its vendor's SDK.
+_PROVIDERS: dict[str, str] = {
+    "daytona": "ptc_agent.core.sandbox.providers.daytona:DaytonaProvider",
+    "docker": "ptc_agent.core.sandbox.providers.docker:DockerProvider",
+    "e2b": "ptc_agent.core.sandbox.providers.e2b:E2BProvider",
+    "ssh": "ptc_agent.core.sandbox.providers.ssh:SSHProvider",
+}
+
+PROVIDER_KINDS = tuple(_PROVIDERS)
+
+# The facts the usage ledger asks of every kind at once, kept here so that
+# answering imports no provider module: reading them off each class loaded every
+# vendor's SDK on the event loop (Daytona's alone about 3s) on a deployment that
+# uses none of them. Each class still declares its own (``SandboxProvider.metered``,
+# ``reports_metrics``, ``reports_allocation``) for the callers holding one kind,
+# and a test holds the two equal.
+METERED_KINDS: tuple[str, ...] = ("daytona", "docker", "e2b")
+METRIC_KINDS: tuple[str, ...] = ("daytona", "e2b")
+ALLOCATION_KINDS: tuple[str, ...] = ("daytona", "e2b")
+# Kinds whose provider stops an idle sandbox on its own at ``auto_stop_interval``
+# (Daytona's auto-stop, E2B's pause deadline). The server's idle sweep runs
+# ahead of that only for these; for the rest the setting is the sweep's.
+SELF_STOPPING_KINDS: tuple[str, ...] = ("daytona", "e2b")
+# Kinds whose computers the deployment builds and can build again: the cloud
+# computers, every kind but a machine of the user's own (``is_own_machine``).
+# Asked on a turn's admission (where Home's stand-in may run), so answering
+# imports no provider module either.
+RECREATABLE_KINDS: tuple[str, ...] = ("daytona", "docker", "e2b")
+
+
+def provider_class(kind: str) -> type[SandboxProvider]:
+    """The provider class for ``kind``, for facts a caller reads without
+    building one (building a provider can set up its client).
+
+    Raises:
+        ValueError: If ``kind`` names no known provider.
+    """
+    target = _PROVIDERS.get(kind) if isinstance(kind, str) else None
+    if target is None:
+        raise ValueError(f"Unknown sandbox provider: {kind!r}")
+    module, _, name = target.partition(":")
+    return getattr(import_module(module), name)
+
+
+def provider_runs_remote(kind: str | None) -> bool:
+    """Whether sandboxes of ``kind`` run off this host; an unknown kind reads as local."""
+    try:
+        return provider_class(kind).runs_remote  # type: ignore[arg-type]
+    except ValueError:
+        return False
+
+
+def is_own_machine(kind: str) -> bool:
+    """Whether a computer of ``kind`` is a machine of the user's own, which the
+    deployment neither builds again nor can always reach (asleep, offline).
+
+    Raises:
+        ValueError: If ``kind`` names no known provider.
+    """
+    return not provider_class(kind).recreatable
+
+
+def builds_computers(sandbox: SandboxConfig) -> bool:
+    """Whether the deployment can make a user a computer on its own: some kind
+    a new computer may be created on is one it can build again. Without one, a
+    user's computers are only the machines they bring.
+    """
+    return any(kind in RECREATABLE_KINDS for kind in sandbox.creatable_providers())
+
+
+def build_provider(
+    kind: str,
+    provider_config: ProviderConfig,
+    *,
+    working_dir: str | None = None,
+    platform_secrets: Sequence[PlatformSecretDefinition] = (),
+) -> SandboxProvider:
+    """Build a provider from one backend's own kind and settings.
+
+    The whole identity of the returned provider arrives through these
+    arguments, so two backends can be addressed from one process.
+    ``platform_secrets`` is the deployment's catalog.
+
+    Raises:
+        ValueError: If ``kind`` names no known provider.
+    """
+    return provider_class(kind)(
+        provider_config,
+        working_dir=working_dir,
+        platform_secrets=platform_secrets,
+    )
+
+
+def create_provider(config: CoreConfig) -> SandboxProvider:
+    """Build the provider one CoreConfig selects.
+
+    Raises:
+        ValueError: If ``sandbox.provider`` names no known provider.
+    """
+    kind = config.sandbox.provider
+    return build_provider(
+        kind,
+        config.sandbox.settings_for(kind),
+        # filesystem.working_directory is the single source of truth for both
+        # providers; the per-provider working_dir field is only a fallback.
+        working_dir=config.filesystem.working_directory,
+        platform_secrets=config.sandbox.platform_secrets,
+    )
