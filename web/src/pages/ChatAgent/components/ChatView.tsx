@@ -1,3 +1,5 @@
+import './CompanyResearch.css';
+import CompanyResearchResult from './CompanyResearchResult';
 import React, { Suspense, useEffect, useEffectEvent, useLayoutEffect, useRef, useState, useCallback, useMemo } from 'react';
 import { useLocation, useNavigate } from 'react-router';
 import { useTranslation } from 'react-i18next';
@@ -1036,7 +1038,7 @@ function ChatView({ workspaceId, threadId, initialTaskId, onBack, workspaceName:
   // The thread's background commands, read once here for the tray and the
   // tool cards, which watch this read in the cache.
   const commands = useThreadCommands(panelThreadId, isActive);
-  const trayContents = useTrayContents({
+  const taskTrayContents = useTrayContents({
     marketWatch,
     commands,
     threadId: panelThreadId ?? null,
@@ -1051,6 +1053,13 @@ function ChatView({ workspaceId, threadId, initialTaskId, onBack, workspaceName:
     owedKinds: reportBackOwedKinds,
     isHome,
   });
+  const trayContents = useMemo(() => {
+    if (isHome) return taskTrayContents;
+    return {
+      ...(taskTrayContents ?? { watch: null, wakeups: null, commands: null, tasks: null, analysts: null, reportBackLabel: null }),
+      researchWorkspaceId: workspaceId,
+    };
+  }, [isHome, taskTrayContents, workspaceId]);
   // A roster task the page only knows from history or its report has no card
   // yet: open it the way its inline card would, which loads its transcript,
   // with the words and status the tray shows rather than a card's defaults.
@@ -1604,7 +1613,7 @@ function ChatView({ workspaceId, threadId, initialTaskId, onBack, workspaceName:
                 onAddContext={handleAddContext}
               />
               {activeAgentId === 'main' ? (
-                <ScrollArea ref={scrollAreaRef} className={`h-full w-full${!isMobile && !rightPanelType ? ' chat-scroll-hide-scrollbar' : ''}`}>
+                <ScrollArea ref={scrollAreaRef} className={`h-full w-full chat-transcript-scroll${!isMobile && !rightPanelType ? ' chat-scroll-hide-scrollbar' : ''}`}>
                   {/* The floor a pinned send holds open (chatView/turnPin); a transition would
                       hand the pin last frame's floor. A thread opened mid-way sits at the
                       bottom under a skeleton, and back on top while a pin holds room. */}
@@ -1645,6 +1654,7 @@ function ChatView({ workspaceId, threadId, initialTaskId, onBack, workspaceName:
                             />
                           </DispatchStatusProvider>
                         </MessageActionsProvider>
+                        {!isHome && <CompanyResearchResult workspaceId={workspaceId} threadId={currentThreadId ?? threadId} />}
                         <TranscriptStatus
                           modelStatus={modelStatus}
                           isLoading={isLoading}
@@ -1826,6 +1836,7 @@ function ChatView({ workspaceId, threadId, initialTaskId, onBack, workspaceName:
                     {workspaceRecord?.computer_id && (
                       <ChatDiskWarning computerId={workspaceRecord.computer_id} />
                     )}
+
                     <FallbackSuggestionPill
                       fallbackSuggestion={fallbackSuggestion}
                       isLoading={isLoading}

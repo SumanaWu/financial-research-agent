@@ -161,6 +161,15 @@ async def assemble_finalize_artifacts(
         "deepthinking": metadata.get("deepthinking", False),
         "is_byok": metadata.get("is_byok", False),
     }
+    if user_id and workspace_id:
+        from src.server.services.company_research import research_result
+        try:
+            delivery = await asyncio.wait_for(research_result(thread_id, user_id), timeout=5)
+            persist_metadata["company_research"] = delivery
+        except Exception:
+            # Research validation never alters the canonical run outcome.
+            # The owner endpoint can retry an unavailable file read later.
+            pass
     for extra in ("workspace_id", "sandbox_id", "locale", "timezone"):
         if metadata.get(extra):
             persist_metadata[extra] = metadata[extra]

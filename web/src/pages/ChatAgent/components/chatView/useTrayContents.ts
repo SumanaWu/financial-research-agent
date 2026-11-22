@@ -63,6 +63,7 @@ export interface TrayContents {
   /** The Analysts this thread handed work to (Home only). */
   analysts: RosterAnalyst[] | null;
   reportBackLabel: string | null;
+  researchWorkspaceId?: string;
 }
 
 const NO_CANDIDATES: ReturnType<typeof analystCandidates> = [];
@@ -84,7 +85,7 @@ export function owedReportKey(kinds: readonly OwedReportKind[] | null, isHome: b
 export function trayChipCount(contents: TrayContents | null): number {
   if (!contents) return 0;
   const { watch, wakeups, commands, tasks, analysts, reportBackLabel } = contents;
-  return [watch, wakeups, commands, tasks, analysts, reportBackLabel].filter((entry) => entry !== null).length;
+  return [watch, wakeups, commands, tasks, analysts, reportBackLabel, contents.researchWorkspaceId ?? null].filter((entry) => entry !== null).length;
 }
 
 /** Whether anything in the tray is still working, which the folded dock spins for. */

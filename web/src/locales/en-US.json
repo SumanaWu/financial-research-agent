@@ -1,4 +1,9 @@
 {
+  "companyResearch": {
+"checking":"Checking…","checked":"Check complete. Results are up to date.",
+"scopeMismatch":"The research file cutoff differs from the submitted scope. Validation failed; start a new research.",
+"focus":"Research focus (optional)",
+"pending":"Not delivered","partial":"Partial","blocked":"Insufficient evidence","invalid":"Validation failed","refresh":"Recheck","checkError":"Cannot read research files; retry verification","title": "Company research", "symbol": "Ticker or CIK", "date": "Research cutoff", "identity": "SEC identity (name and contact email)", "resolve": "Resolve company", "start": "Start research", "ambiguous": "Company is ambiguous; use a CIK"},
   "common": {
     "submit": "Submit",
     "staleBuild": {

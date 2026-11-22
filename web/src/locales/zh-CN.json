@@ -1,4 +1,9 @@
 {
+  "companyResearch": {
+"checking":"正在校验…","checked":"校验完成，结果已更新。",
+"scopeMismatch":"研究文件的截止时间与提交的时间不一致，结果未通过校验。请重新发起研究。",
+"focus":"研究重点（可选）",
+"pending":"研究尚未交付","partial":"部分完成","blocked":"资料不足","invalid":"校验失败","refresh":"重新校验","checkError":"无法读取研究文件，请稍后重新校验","title": "公司研究", "symbol": "Ticker 或 CIK", "date": "研究截止日", "identity": "SEC 访问身份（姓名和联系邮箱）", "resolve": "核对公司", "start": "开始研究", "ambiguous": "无法唯一确定公司，请使用 CIK"},
   "common": {
     "submit": "提交",
     "staleBuild": {

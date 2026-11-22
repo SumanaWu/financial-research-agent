@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import json
 import re
 import threading
 import time
@@ -492,7 +493,11 @@ async def run_workflow_script(
             ctx.register("__host_phase", _host_phase, is_async=False)
             ctx.register("__host_log", _host_log, is_async=False)
             ctx.eval(f"{prelude}\nundefined;")
-            ctx.globals["args"] = args
+            # The native object marshaller rejects nested empty strings. Parse
+            # JSON in the VM so valid JSON arguments keep their exact values.
+            ctx.eval(
+                f"globalThis.args = JSON.parse({json.dumps(json.dumps(args, ensure_ascii=True))});"
+            )
             handle = await ctx.eval_handle_async(wrapped, timeout=limits.cpu_budget_s)
             with handle:
                 resolved = await handle.await_promise(timeout=None)

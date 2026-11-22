@@ -1,0 +1,20 @@
+import { render, screen, fireEvent, waitFor } from '@testing-library/react';
+import { vi, test, expect } from 'vitest';
+import CompanyResearchForm from '../CompanyResearchForm';
+const { navigate, resolve, create } = vi.hoisted(() => ({ navigate: vi.fn(), resolve: vi.fn(), create: vi.fn() }));
+vi.mock('react-router', () => ({ useNavigate: () => navigate }));
+vi.mock('../../utils/api/companyResearch', () => ({ resolveResearchCompany: resolve }));
+vi.mock('../../utils/api/threads', () => ({ createThreadWithTitle: create }));
+test('confirms identity before creating a research thread and sending its opening scope', async () => {
+  resolve.mockResolvedValue([{ cik: '0000320193', name: 'Apple', ticker: 'AAPL' }]);
+  create.mockResolvedValue({ thread_id: 'new-thread' });
+  render(<CompanyResearchForm workspaceId="workspace" />);
+  fireEvent.click(screen.getByRole('button', { name: /公司研究|Company research/ }));
+  fireEvent.change(screen.getByLabelText(/SEC/), { target: { value: 'Test contact@domain.org' } });
+  fireEvent.submit(screen.getByRole('button', { name: /核对公司|Resolve company/ }).closest('form')!);
+  await screen.findByText(/Apple/);
+  expect(create).not.toHaveBeenCalled();
+  fireEvent.submit(screen.getByRole('button', { name: /开始研究|Start research/ }).closest('form')!);
+  await waitFor(() => expect(navigate).toHaveBeenCalled());
+  expect(create.mock.calls[0][0].companyResearch.cik).toBe('0000320193');
+});

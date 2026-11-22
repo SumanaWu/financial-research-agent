@@ -17,6 +17,24 @@
 - 金融工具：MCP、Yahoo Finance、FMP、SEC 资料、行情与宏观插件；部分接口需要额外账号或套餐。
 - 产物：Python 数据分析、chartkit 图表、研究与文档 Skills、工作区文件。
 
+## 第一阶段优化总结
+
+第一阶段已完成 Mac 本地的单公司 SEC 研究闭环：通过已配置的 DeepSeek，从表单提交公司和截止日，经取数、计算和分析复核，交付带来源的 HTML 报告与 Excel 工作簿。实施与验收记录截至 2026 年 11 月 22 日。
+
+| 方向 | 已完成的能力与修复 |
+| --- | --- |
+| 公司研究入口 | 支持 ticker／CIK 核对、研究截止日、SEC 请求身份和可选重点；创建专用研究线程，运行 `company-research-v1` 的取数计算、复核交付两阶段流程。 |
+| 历史证据与范围 | 保存 SEC 原始申报与数据快照，按申报接受时间筛选证据，排除截止日之后的资料和修订；区分独立季度与累计期间。后端固定研究范围，修复截止时间的时区、精度和比较问题。 |
+| 财务计算与校验 | 确定性计算收入增长、自由现金流、净利率、资产负债率及现金流转化率；检查缺失值、币种、资产负债表关系、来源引用和文件哈希。研究工具范围收敛，减少引入当前行情或外部写入操作。 |
+| 报告与工作簿 | 生成包含业务、趋势、风险、缺口及来源的报告；标题显示公司名，叙述引用可点击 SEC 来源。工作簿首页通过公式关联核心指标，Checks 汇总失败和缺失项，改善打印分页与长来源文字显示；支持文字更新时保留已复核工作簿。 |
+| 研究交互 | 表单改为独立弹窗，结果放入消息滚动区；公司研究与任务入口统一样式和固定顺序，复用收起交互。修复内容遮挡及滚动补偿冲突，并为重新校验增加加载、完成和失败反馈。 |
+| 工作流兼容 | 修复空 `focus` 在工作流引擎中的序列化错误，CLI 兼容 `null` 并规范化为空字符串；保留原有运行、取消、历史与收尾机制。 |
+| Mac 使用流程 | 提供稳定研究模式的启动、检查和停止命令，关闭后端热重载，避免编辑代码时打断研究；前端更新、后端重启、数据复算及故障排查步骤统一在本 README。 |
+
+已验证 DeepSeek 实际调用、代码执行与文件保存、AAPL／MSFT 的 SEC 取数，以及 AAPL 从模型到报告交付的完整链路。选定研究测试 22 项、工作流引擎测试 21 项通过；前端类型检查、生产构建与首屏体积检查通过，多 worker 的启动互斥、取消和请求去重选定检查通过。最新 Apple 工作簿 42 个公式重算无错误、严格审计无发现，8 项明细检查和总检查均为 OK，交付文件哈希匹配。详细记录见 [VALIDATION.md](VALIDATION.md)；这些结果不代表全仓库全量测试或完整故障矩阵已通过。
+
+当前边界：尚未接入可验证历史时点的行情与估值数据，因此报告通常显示“部分完成”，应同时查看具体缺口和校验错误；季度覆盖目前以最近一份合格 10-Q 的可验证字段为主，不保证完整季度趋势。自定义 XBRL 标签和历史资料覆盖仍可能不足，来源 ID 可定位也不等于叙述已获充分支持，分析结论仍需复核。第一阶段完成不代表上述数据能力已经补齐。
+
 ## 环境准备
 
 本机需要 Git 以外的常规开发工具即可，源码已包含在包内，无需拉取仓库。完整启动需要 Docker 与 Compose v2。手动开发需要 Python 3.13+、uv、Node.js 24+ 和各 `package.json` 中指定的 pnpm 版本。后端与沙箱 Python 的版本要求不同，请以各自配置为准。
@@ -25,7 +43,7 @@
 
 ## 一条本地部署路径
 
-以下命令在项目根目录执行。
+以下命令在项目根目录执行。仅在没有 `.env` 时复制模板；已有配置请保留，不要覆盖。
 
 ```bash
 cp .env.example .env
@@ -61,6 +79,89 @@ curl http://localhost:8000/health
 ```
 
 停止服务使用 `docker compose down`；不要在需要保留研究数据时随意删除数据库卷。
+
+### Mac 公司研究模式
+
+已接通 DeepSeek 后，可以在 Terminal 中启动关闭后端热重载的本地研究模式：
+
+```bash
+cd ~/Desktop/financial-research-agent
+open -a Docker
+docker info
+docker compose version
+make research-up
+docker compose ps
+make research-check
+curl http://localhost:8000/health
+open http://localhost:5173
+```
+
+首次下载依赖可能较慢。若 `make` 不可用，可先运行 `xcode-select --install`。检查脚本不打印密钥；启动期间若显示 FAIL，等待初始化后重试。健康检查通过仅表示服务可访问，模型和研究流程仍需单独验证。确认 `.env` 的本地模式、Docker 沙箱和 DeepSeek 配置可用；`agent_config.yaml` 的模型名为 `llm.name`，不要重复嵌套 `llm`。
+
+#### 验证聊天和公司研究
+
+1. 在网页中选择或创建 Docker 计算机和工作区，新建普通对话，发送“只回答 OK，不调用工具”，确认 DeepSeek 能回复。再让它执行 `print(2 + 2)` 并保存测试文件，检查代码执行、文件面板和刷新后的历史记录。
+2. 在工作区对话输入框附近点击“公司研究”。例如输入 `AAPL` 或 CIK `320193`，选择 `2024-12-31`，填写真实 SEC 请求身份（项目名和联系邮箱，可使用 `financial-research-agent sumanaocean@gmail.com`），按需填写研究重点。
+3. 点击“核对公司”，确认 Apple 和 CIK `0000320193`，再点击“开始研究”。等待 `company-research-v1` 的取数和复核阶段及交付完成；主 Agent 回复结束不一定代表后台任务已结束。
+4. 在研究结果区点击“重新校验”，并打开或下载报告与工作簿。公司或截止日改变时请创建新的研究线程；普通追问可复用原有快照。仅更新文字时，可更新 `analysis.json` 后运行 `company_research.cli render`，保留已复核的工作簿。
+
+研究文件位于工作区 `research/<线程 ID>/`：`report.html` 和 `research.xlsx` 是报告与工作簿；`request.json` 保存研究范围；`sources.json` 和 `raw/` 保存 SEC 来源与原始材料；`observations.json`、`quarterly.json` 和 `metrics.json` 保存数据及计算结果；`analysis.json` 保存分析与引用；`validation.json` 和 `manifest.json` 用于校验；`calculate.py`、`research_core.py` 和 `requirements.txt` 可用于复算。
+
+选取资料依据 SEC 接受时间，而非仅看报告期。历史行情和估值时点无法核实时会留作缺口，状态可能显示“部分完成”；这不等于研究运行失败，也不代表缺失数据已经补齐。交付状态与运行状态是两回事。
+
+如需离线复算，先下载整个研究目录，在该目录的 Terminal 中执行以下命令，再将输出与 `metrics.json` 对照。复算不需要再次访问 SEC 或调用模型。
+
+```bash
+python3 -m venv .research-venv
+source .research-venv/bin/activate
+python -m pip install -r requirements.txt
+python calculate.py
+```
+
+进一步验收时，可在运行中刷新页面、在独立测试线程中停止任务、用较早截止日检查资料缺口，并对 MSFT（CIK `789019`）创建另一份研究，确认目录隔离。校验截止时间、来源、计算和文件指纹时，不应通过改写状态或重新生成指纹掩盖内容错误。服务端结果也可通过 `GET /api/v1/threads/<线程 ID>/company-research` 查看。
+
+关闭浏览器页面不会停止后台服务。停止本地研究服务时，在 Terminal 中执行：
+
+```bash
+cd ~/Desktop/financial-research-agent
+make research-down
+```
+
+该命令保留数据库和 Redis 数据卷。不要使用 `docker compose down -v`，以免删除需要保留的数据。如果另行在 Terminal 中手动运行了前端 `pnpm dev` 或后端开发服务器，请回到对应窗口按 **Control + C** 停止。
+
+#### 日常启动与代码更新
+
+首次启动或镜像不存在时，使用上面的 `make research-up` 构建镜像。日常停止后，如果代码和依赖没有变化，可以使用已有镜像启动，跳过显式构建：
+
+```bash
+cd ~/Desktop/financial-research-agent
+docker compose -f docker-compose.yml -f deploy/compose.research.yml up -d
+make research-check
+```
+
+代码更新后，根据改动范围处理：
+
+- **前端页面代码**：Vite 通常会自动更新，必要时刷新浏览器。
+- **后端 Python 代码**：研究模式关闭了后端热重载，以免中断正在进行的研究。确认没有研究任务运行后，只重启后端：
+
+  ```bash
+  docker compose -f docker-compose.yml -f deploy/compose.research.yml restart backend
+  make research-check
+  ```
+
+- **依赖、Dockerfile 或图表构建资源**：可能需要重新构建，在项目根目录执行 `make research-up`。构建期间如需重建服务，先确认没有正在运行的研究任务。
+
+当前后端镜像构建会在安装依赖之前复制 `README.md`；修改该文件也可能使后续构建缓存失效，导致依赖和浏览器重新安装。
+
+#### 日志与排查
+
+```bash
+docker compose logs --tail=100 backend
+docker compose logs --tail=100 cli
+docker compose logs --tail=100 frontend
+```
+
+聊天失败时检查模型配置；代码执行失败时检查 Docker 和计算机状态；SEC 取数失败时检查请求身份、网络和限流；报告校验失败时检查研究范围、来源、计算及 manifest。重启或进程恢复后，应检查任务记录，不能假定它会从任意代码行继续执行。
 
 ## 手动开发
 
@@ -103,8 +204,10 @@ pnpm build
 
 ```bash
 uv run pytest tests/unit/ -q --tb=short
+uv run pytest tests/research/ -q --confcutdir=tests/research
 cd web
 pnpm typecheck
+pnpm exec vitest run src/pages/ChatAgent/components/__tests__/CompanyResearchForm.test.tsx src/locales/__tests__/keys.test.ts
 pnpm build
 pnpm test
 ```
@@ -113,7 +216,7 @@ pnpm test
 
 ## 优先改造方向
 
-先完成单市场、单公司、只读研究闭环，再补研究假设的版本历史、证据有效期、指标口径与对照评估。若加入真实交易，须单独测试权限变更、审批绑定、失败恢复和券商对账，不能把研究 Agent 的提示词当作交易授权。
+在第一阶段单公司研究闭环基础上，后续可补充历史行情与估值、季度覆盖、研究假设的版本历史、证据有效期、指标口径与对照评估。若加入真实交易，须单独测试权限变更、审批绑定、失败恢复和券商对账，不能把研究 Agent 的提示词当作交易授权。
 
 本项目需要持久化后端和执行环境。Supabase 可承担 PostgreSQL 和认证等部分能力，Vercel 可用于适配后的前端托管；后台执行、Redis 和 Docker 沙箱仍需要独立服务。
 

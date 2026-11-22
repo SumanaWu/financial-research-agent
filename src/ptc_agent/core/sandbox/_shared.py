@@ -49,6 +49,7 @@ _MCP_SHARED_RUNTIME_FILES: tuple[str, ...] = (
 # ``market_protocol/instruments.yaml``) can never silently drop.
 _SANDBOX_INTERNAL_PACKAGES: dict[str, str] = {
     "data_client": "src.data_client",
+    "company_research": "src.company_research",
     "market_protocol": "market_protocol",
     # The chart layer library agent code imports. Its render page
     # (``chartkit/render/``, built from web/ by ``pnpm build:chart-render``)

@@ -99,3 +99,14 @@ setup-db: ## Start PostgreSQL + Redis in Docker and initialize tables
 
 migrate: ## Run database migrations
 	uv run alembic upgrade head
+
+.PHONY: research-up research-down research-check
+research-up: ## Start stable local Docker research stack without backend hot reload
+	docker build -f Dockerfile.sandbox -t finworkbench-sandbox:latest .
+	docker compose -f docker-compose.yml -f deploy/compose.research.yml up --build -d
+
+research-down: ## Stop the research stack while preserving data volumes
+	docker compose -f docker-compose.yml -f deploy/compose.research.yml down
+
+research-check: ## Check Mac local research readiness without exposing credentials
+	python3 scripts/research_check.py

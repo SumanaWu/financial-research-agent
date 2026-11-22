@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import json
 import threading
 import time
 from typing import Any
@@ -34,6 +35,20 @@ class FakeHost:
 
     def log(self, message: str) -> None:
         self.logs.append(message)
+
+
+@pytest.mark.asyncio
+async def test_nested_empty_string_args_reach_agent() -> None:
+    host = FakeHost()
+    params = {"focus": "", "nested": ["", None, {"text": '引号"\\\n'}]}
+    outcome = await run_workflow_script(
+        _script("await agent(JSON.stringify(args)); return 'done';"),
+        params,
+        host,
+        WorkflowLimits(),
+    )
+    assert outcome.status == "completed"
+    assert json.loads(host.agent_calls[0][0]) == params
 
 
 @pytest.mark.asyncio

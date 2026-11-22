@@ -1723,3 +1723,6 @@ app.include_router(
 app.include_router(
     market_data_ws_router
 )  # /ws/v1/market-data/* - Real-time WS proxy (or just status endpoint when disabled)
+
+from src.server.app.company_research import router as company_research_router
+app.include_router(company_research_router)

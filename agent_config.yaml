@@ -7,14 +7,20 @@
 # For non agent related config, see config.yaml
 
 llm:
-  # Model name from src/llms/manifest/models.json
-  name: "claude-opus-5-5"
-  background: "claude-sonnet-5-5"
-  compaction: "" # blank → the model the turn runs
-  fetch: ""         # blank → the background model
-  fallback:
-    - "deepseek-flash"
-    - "glm-5.2"
+  # # Model name from src/llms/manifest/models.json
+  # name: "claude-opus-5-5"
+  # background: "claude-sonnet-5-5"
+  # compaction: "" # blank → the model the turn runs
+  # fetch: ""         # blank → the background model
+  # fallback:
+  #   - "deepseek-flash"
+  #   - "glm-5.2"
+  llm:
+  name: "deepseek-flash"
+  background: "deepseek-flash"
+  compaction: ""
+  fetch: ""
+  fallback: []
 
 sandbox:
   # Provider selection: "daytona" or "e2b" (cloud), or "docker" (local).

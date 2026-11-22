@@ -288,6 +288,7 @@ class PTCAgent:
         user_data_counts: dict[str, Any] | None = None,
         tool_summary: str | None = None,
         disable_subagents: bool = False,
+        research_only: bool = False,
         direct_mcp: DirectToolSet | None = None,
         order_ledger: OrderLedger | None = None,
         turn_context: TurnContext | None = None,
@@ -477,6 +478,8 @@ class PTCAgent:
             call_context=call_context,
             file_tools_only=file_tools_only,
         )
+        if research_only:
+            code_tool = partial(code_tool, allowed_servers=frozenset())
         execute_code_tool = code_tool(hand_off=hand_off)
 
         # Create the Bash tool for shell command execution
@@ -488,6 +491,8 @@ class PTCAgent:
             call_context=call_context,
             file_tools_only=file_tools_only,
         )
+        if research_only:
+            shell_tool = partial(shell_tool, allowed_servers=frozenset())
         bash_tool = shell_tool(hand_off=hand_off)
         # A subagent already runs in the background, so its calls wait for
         # their commands instead of handing them off: nothing reports back to
@@ -745,6 +750,11 @@ class PTCAgent:
 
         # Consent is re-read per call and an order is put to the user against
         # a durable attempt, which is what execution then reads.
+        if research_only:
+            from ptc_agent.agent.research_policy import research_tools
+            shared_tools = research_tools(shared_tools)
+            finance_tools = []
+            direct_mcp = None
         direct_tools = list(direct_mcp.tools) if direct_mcp is not None else []
         main_only_middleware.extend(direct_tool_middleware(direct_mcp, order_ledger))
 
@@ -760,13 +770,13 @@ class PTCAgent:
                 execute_code=sub_code_tool,
                 bash=sub_bash_tool,
                 filesystem=subagent_filesystem_tools,
-                web=[web_search_tool, web_fetch_tool],
+                web=[] if research_only else [web_search_tool, web_fetch_tool],
                 finance=finance_tools,
                 todo=todo_tools,
                 search_tool=search_tool,
                 sandbox_tools=lambda allowed: [
-                    code_tool(allowed_servers=allowed),
-                    shell_tool(allowed_servers=allowed),
+                    code_tool(allowed_servers=frozenset() if research_only else allowed),
+                    shell_tool(allowed_servers=frozenset() if research_only else allowed),
                 ],
                 turn_context=turn_context,
                 user_profile=user_profile,
@@ -1286,6 +1296,9 @@ class PTCAgent:
             tools = [*tools, *CHIEF_OF_STAFF_TOOLS]
         if direct_tools:
             tools = [*tools, *direct_tools]
+
+        if research_only:
+            tools = research_tools(tools)
 
         agent: Any = create_agent(
             turn.client,

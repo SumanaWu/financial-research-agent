@@ -12,6 +12,7 @@ import type { SearchKind } from '@/api/search';
  *     → invalidates all workspace list queries (any page/sort)
  */
 export const queryKeys = {
+  companyResearch: { detail: (threadId: string) => ['company-research', threadId] },
   user: {
     all:         ['user'],
     me:          () => [...queryKeys.user.all, 'me'],

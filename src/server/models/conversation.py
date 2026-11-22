@@ -12,6 +12,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 
 from src.server.models.report import PlatformStatus, ReportClient, ReportFollowUp
 
+from src.company_research.core import ResearchRequest
 from src.llms.reasoning import ReasoningLevel
 from src.server.utils.thread_stamp import SCANNED_CHARS
 
@@ -259,6 +260,7 @@ class ThreadCreateRequest(BaseModel):
     workspace_id: Optional[str] = Field(
         None, description="Target workspace; Home's id for the user's Home"
     )
+    company_research: Optional[ResearchRequest] = None
     first_query: str = Field(
         "",
         description="The user's first message; stamped as the initial title "

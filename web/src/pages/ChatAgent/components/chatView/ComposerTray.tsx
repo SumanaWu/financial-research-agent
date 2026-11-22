@@ -1,3 +1,4 @@
+import CompanyResearchForm from '../CompanyResearchForm';
 import { useId, useLayoutEffect, useRef, useState, type ReactNode, type Ref, type RefObject } from 'react';
 import { useTranslation } from 'react-i18next';
 import { ArrowUpRight, ChevronUp, Folder } from 'lucide-react';
@@ -109,6 +110,7 @@ export function ComposerTray({
         {wakeups && <WakeupsChip list={wakeups} threadId={threadId} />}
         {commands && <CommandsChip rows={commands} onOpen={onOpenCommand} />}
         {tasks && <TasksChip {...tasks} onOpen={onOpenTask} />}
+        {contents.researchWorkspaceId && <CompanyResearchForm workspaceId={contents.researchWorkspaceId} />}
         {analysts && <AnalystsChip threads={analysts} from={from} />}
         {reportBackLabel && <StatusChip label={reportBackLabel} />}
       </motion.div>

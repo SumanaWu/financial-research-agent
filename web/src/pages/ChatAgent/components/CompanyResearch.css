@@ -1,0 +1,5 @@
+/* The transcript controller owns anchoring; browser anchoring must not
+   independently compensate for growing streamed code or reasoning blocks. */
+.chat-transcript-scroll > div {
+  overflow-anchor: none;
+}

@@ -127,6 +127,12 @@ async def create_thread_endpoint(
     # since the first message may be no words of the user's at all. Else the
     # same stamp ensure_thread_exists would apply, which is also the CAS
     # expectation the title generator swaps against.
+    if request.company_research:
+        from src.company_research.core import cutoff
+        from datetime import datetime, timezone
+        request.company_research.cutoff_at = min(
+            cutoff(request.company_research), datetime.now(timezone.utc)
+        )
     named_title = request.title
     title_stamp = named_title if named_title is not None else stamped_title(request.first_query)
 
@@ -138,6 +144,7 @@ async def create_thread_endpoint(
             current_status="completed",
             thread_index=None,
             title=title_stamp,
+            metadata={"company_research": request.company_research.model_dump(mode="json")} if request.company_research else None,
             platform=request.platform,
             subagents_allowed=request.subagents_allowed,
             reasoning_effort=request.reasoning_effort,

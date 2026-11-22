@@ -479,6 +479,14 @@ async def astream_ptc_workflow(
             if effective_model:
                 query_metadata["llm_model"] = effective_model
             query_metadata.update(provenance_metadata(request))
+            # Persisted thread scope survives retry and browser reload.
+            from src.server.database.conversation.threads_read import get_thread_by_id
+            research_thread = await get_thread_by_id(thread_id)
+            research_spec = ((research_thread or {}).get("metadata") or {}).get("company_research")
+            if research_spec:
+                query_metadata["company_research"] = research_spec
+                user_input += "\nCompany research scope (immutable): " + json.dumps(research_spec) + "\nUse the company-research skill. Keep all facts within the as_of cutoff. Output directory: research/" + thread_id
+
 
             # Extract attachment and context metadata for display in history
             # (skipped for HITL resumes)
@@ -834,6 +842,7 @@ async def astream_ptc_workflow(
             # need TaskOutput to fetch the result); their re-announce
             # recursion is handled by the outbox's ledger arbitration.
             disable_subagents=bool(request.disable_subagents),
+            research_only=bool(query_metadata.get("company_research")),
             operation_callback=None,
             # I2: the run's fenced session-bound saver when the WriterGuard
             # is active; the global pooled saver otherwise.
@@ -998,6 +1007,10 @@ async def astream_ptc_workflow(
         # =====================================================================
         # Save user request to system thread directory (non-critical)
         # =====================================================================
+        if query_metadata.get("company_research") and session.sandbox and project:
+            scope_path = session.sandbox.workspace(project).join(f"research/{thread_id}/scope.json")
+            await session.sandbox.awrite_file_text(scope_path, json.dumps(query_metadata["company_research"], ensure_ascii=False))
+
         if not request.hitl_response and session.sandbox and project:
             short_id = thread_id[:8]
             try:

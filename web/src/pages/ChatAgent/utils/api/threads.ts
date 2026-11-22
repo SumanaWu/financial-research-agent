@@ -32,6 +32,7 @@ export async function createThreadWithTitle(opts: {
   workspaceId?: string | null;
   /** May be empty when `title` is given. */
   firstQuery: string;
+  companyResearch?: { cik: string; as_of: string; focus: string };
   /** The thread's title, in place of one generated from `firstQuery`. */
   title?: string;
   platform?: string | null;
@@ -51,6 +52,7 @@ export async function createThreadWithTitle(opts: {
   } = opts;
 
   const body: Record<string, unknown> = { first_query: firstQuery };
+  if (opts.companyResearch) body.company_research = opts.companyResearch;
   if (title) body.title = title;
   if (workspaceId) body.workspace_id = workspaceId;
   if (platform) body.platform = platform;
